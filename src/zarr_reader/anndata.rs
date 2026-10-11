@@ -89,21 +89,41 @@ impl Layout {
         (rank.unwrap_or(usize::MAX), path.to_string())
     }
 
-    /// The node whose tables hold the array at `path`: the node of the variable
-    /// it belongs to, which is the outermost encoded group around it
-    /// (categorical, nullable, sparse) or else the array itself.
-    pub fn node_of_array(&self, path: &str) -> String {
-        let variable = self_and_ancestors(node_of(path))
+    /// Whether the group at `path` holds one encoded variable (a categorical,
+    /// a nullable column, a sparse matrix).
+    pub fn is_variable(&self, path: &str) -> bool {
+        !path.is_empty()
+            && self
+                .encoding_of(path)
+                .is_some_and(|e| is_variable_encoding(&e))
+    }
+
+    /// The encoded variable that `path` is part of: `path` itself if it is an
+    /// encoded group, else the outermost encoded group above it.
+    pub fn variable_of(&self, path: &str) -> Option<String> {
+        self_and_ancestors(path)
             .into_iter()
             .rev()
-            .find(|g| {
-                !g.is_empty()
-                    && self
-                        .encoding_of(g)
-                        .is_some_and(|e| is_variable_encoding(&e))
-            })
-            .unwrap_or_else(|| path.to_string());
-        logical_node(node_of(&variable), |g| self.encoding_of(g))
+            .find(|g| self.is_variable(g))
+    }
+
+    /// The node whose tables hold the element at `path` (an array or an
+    /// encoded group): the group that holds it, with the `obs`, `var` and
+    /// `raw/var` data frames folded into their parent ([`logical_node`]).
+    pub fn node_of(&self, path: &str) -> String {
+        logical_node(node_of(path), |g| self.encoding_of(g))
+    }
+
+    /// Whether the element at `path` is a column of a data frame.
+    pub fn is_frame_column(&self, path: &str) -> bool {
+        self.encoding_of(node_of(path)).as_deref() == Some("dataframe")
+    }
+
+    /// The node whose tables hold the array at `path`: the node of the variable
+    /// it belongs to, which is the encoded group around it or else the array
+    /// itself.
+    pub fn node_of_array(&self, path: &str) -> String {
+        self.node_of(&self.variable_of(path).unwrap_or_else(|| path.to_string()))
     }
 }
 
@@ -120,14 +140,8 @@ pub fn check_group_path(
     let Some(layout) = layout else {
         return Ok(());
     };
-    let variable = self_and_ancestors(node).into_iter().rev().find(|g| {
-        !g.is_empty()
-            && layout
-                .encoding_of(g)
-                .is_some_and(|e| is_variable_encoding(&e))
-    });
-    if let Some(variable) = variable {
-        let parent = logical_node(node_of(&variable), |g| layout.encoding_of(g));
+    if let Some(variable) = layout.variable_of(node) {
+        let parent = layout.node_of(&variable);
         return Err(format!(
             "'{store_path}': in an AnnData store, '{}' is part of the variable '{variable}', \
              not a group of tables. It is a column of a table in group '{}'; read it alone \
@@ -277,15 +291,7 @@ pub fn variable_table(
     layout: &Layout,
     path: &str,
 ) -> Result<Option<Table>, Box<dyn std::error::Error>> {
-    let is_variable = |g: &str| {
-        layout
-            .encoding_of(g)
-            .is_some_and(|e| is_variable_encoding(&e))
-    };
-    let inside_another = self_and_ancestors(node_of(path))
-        .iter()
-        .any(|g| !g.is_empty() && is_variable(g));
-    if path.is_empty() || !is_variable(path) || inside_another {
+    if layout.variable_of(path).as_deref() != Some(path) {
         return Ok(None);
     }
     let encoding = layout.encoding_of(path).unwrap_or_default();
@@ -311,13 +317,13 @@ pub fn variable_table(
         coords: Vec::new(),
         variables: vec![Variable {
             path: path.to_string(),
-            node: logical_node(node_of(path), |g| layout.encoding_of(g)),
+            node: layout.node_of(path),
             dims: Some(dims),
             shape,
             chunk_shape,
             attrs: Default::default(),
             storage,
-            in_dataframe: layout.encoding_of(node_of(path)).as_deref() == Some("dataframe"),
+            in_dataframe: layout.is_frame_column(path),
         }],
     }))
 }

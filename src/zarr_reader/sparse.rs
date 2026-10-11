@@ -7,7 +7,7 @@
 //! every cell anyway. In both cases a cell a matrix does not store reads as 0,
 //! which is its value.
 
-use super::meta::{open_array, parse_dtype, read_index_range, ZarrArray, ZarrStore};
+use super::meta::{open_array, parse_dtype, ZarrArray, ZarrStore};
 use super::types::{SparseMatrix, ZarrDtype};
 
 /// Minor indices of a run of stored entries, and their values if requested.
@@ -242,6 +242,40 @@ pub fn decode_block(
         }
     }
     Ok(block)
+}
+
+/// Read `arr[start..end]` of a 1-D integer array (a sparse matrix's `indices`
+/// or `indptr`) as `u64`. Negative values are an error.
+fn read_index_range(
+    arr: &ZarrArray,
+    name: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    let dtype = parse_dtype(arr, name)?;
+    if !dtype.is_integer() {
+        return Err(format!("'{name}' is not an integer array").into());
+    }
+    if start == end {
+        return Ok(Vec::new());
+    }
+    let subset = zarrs::array::ArraySubset::new_with_ranges(std::slice::from_ref(&(start..end)));
+    let bytes = arr
+        .retrieve_array_subset::<zarrs::array::ArrayBytes<'static>>(&subset)?
+        .into_fixed()
+        .map_err(|_| format!("'{name}' has a variable-length dtype"))?;
+    let size = dtype.byte_size().expect("integer dtypes have a fixed size");
+    bytes
+        .chunks_exact(size)
+        .map(|b| {
+            let v = super::scan::read_int_as_i64_pub(b, &dtype, 0);
+            if v < 0 && !dtype.is_unsigned() {
+                Err(format!("'{name}' holds a negative index").into())
+            } else {
+                Ok(v as u64)
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

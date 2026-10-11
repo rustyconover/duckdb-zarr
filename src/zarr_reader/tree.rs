@@ -108,27 +108,27 @@ impl StoreTree {
         // groups (categoricals, nullable columns, sparse matrices) as one
         // variable each (decision 9). Other stores skip this entirely.
         let layout = anndata::layout(store, array_names);
-        let encodings = layout.as_ref().map(|l| &l.encodings);
         let encoding_of = |group: &str| layout.as_ref().and_then(|l| l.encoding_of(group));
-        let logical = |path: &str| anndata::logical_node(node_of(path), encoding_of);
-        let in_dataframe = |path: &str| encoding_of(node_of(path)).as_deref() == Some("dataframe");
-        let wanted = |path: &str| nodes.is_none_or(|nodes| nodes.contains(&logical(path)));
-        let is_variable_group = |group: &str| {
-            !group.is_empty()
-                && encoding_of(group).is_some_and(|e| anndata::is_variable_encoding(&e))
+        // Without an AnnData layout, an element belongs to the group that holds
+        // it and nothing is a data frame column or part of an encoded group.
+        let logical = |path: &str| match &layout {
+            Some(layout) => layout.node_of(path),
+            None => node_of(path).to_string(),
         };
+        let in_dataframe = |path: &str| layout.as_ref().is_some_and(|l| l.is_frame_column(path));
         // The arrays of an encoded variable belong to it, not to its group.
         let inside_variable = |path: &str| {
-            self_and_ancestors(node_of(path))
-                .iter()
-                .any(|g| is_variable_group(g))
+            layout
+                .as_ref()
+                .is_some_and(|l| l.variable_of(node_of(path)).is_some())
         };
+        let wanted = |path: &str| nodes.is_none_or(|nodes| nodes.contains(&logical(path)));
 
         let mut tree = StoreTree::default();
         for name in array_names {
             if !wanted(name)
                 || inside_variable(name)
-                || (encodings.is_some() && anndata::is_unstructured(name))
+                || (layout.is_some() && anndata::is_unstructured(name))
             {
                 continue;
             }
@@ -185,7 +185,7 @@ impl StoreTree {
             return Ok(tree);
         };
         for (group, encoding) in &anndata_layout.encodings {
-            if !is_variable_group(group) || !wanted(group) || inside_variable(group) {
+            if !anndata_layout.is_variable(group) || !wanted(group) || inside_variable(group) {
                 continue;
             }
             let Some(storage) = anndata::variable_storage(anndata_layout, group, encoding)? else {

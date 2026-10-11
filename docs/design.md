@@ -162,7 +162,8 @@ The code, the docs and the error messages use these terms. Older sections of thi
 | store | A Zarr hierarchy | A database, mounted by hand (decision 8) | `ZarrStore` |
 | node | A Zarr group, as a node of an `xarray.DataTree` | A schema; the root is `main` | a group path (`""` is the root) |
 | variable | Values over named dimensions, stored as one array | A data column | `Variable` |
-| storage | How a variable's values are stored: one array, or one that zarrs cannot open | | `Storage` |
+| storage | How a variable's values are stored: one array, one that zarrs cannot open, or (AnnData, decision 9) a group of arrays: categorical, nullable, sparse | | `Storage` |
+| scan plan | How a table's rows are produced: one per cell, or one per stored entry for a table of sparse matrices only | | `ScanPlan` |
 | table | The variables of one node that share dimension names and shape | A table (a view) | `Table` |
 | coordinate | The values of a dimension, from an array in the node or an ancestor | A dimension column | `Table::coords` |
 | encoding | How stored values decode: CF packing, CF time | The column's type | `ColumnEncoding` |
