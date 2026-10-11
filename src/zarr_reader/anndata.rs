@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use super::meta::{first_chunk_shape, open_array, ZarrStore};
 use super::tree::{basename, display_group, join, node_of, self_and_ancestors};
-use super::types::{DimGroup, SparseMatrix, VarEncoding};
+use super::types::{SparseMatrix, Storage, Table, Variable};
 
 /// The dimension of AnnData's rows (cells): `n_obs` long.
 pub const OBS: &str = "obs";
@@ -232,23 +232,22 @@ pub fn is_variable_encoding(encoding: &str) -> bool {
     VARIABLE_ENCODINGS.contains(&encoding)
 }
 
-/// The variable stored in the group at `path` with the given encoding.
-pub fn variable_encoding(
+/// How the variable in the group at `path`, with the given `encoding-type`,
+/// is stored, or `None` if the encoding does not hold one variable.
+pub fn variable_storage(
     layout: &Layout,
     path: &str,
     encoding: &str,
-) -> Result<Option<VarEncoding>, Box<dyn std::error::Error>> {
+) -> Result<Option<Storage>, Box<dyn std::error::Error>> {
     Ok(Some(match encoding {
-        "categorical" => VarEncoding::Categorical {
+        "categorical" => Storage::Categorical {
             codes: join(path, "codes"),
             categories: join(path, "categories"),
         },
-        "nullable-integer" | "nullable-boolean" | "nullable-string-array" => {
-            VarEncoding::Nullable {
-                values: join(path, "values"),
-                mask: join(path, "mask"),
-            }
-        }
+        "nullable-integer" | "nullable-boolean" | "nullable-string-array" => Storage::Nullable {
+            values: join(path, "values"),
+            mask: join(path, "mask"),
+        },
         "csr_matrix" | "csc_matrix" => {
             let shape = layout
                 .sparse_shapes
@@ -256,7 +255,7 @@ pub fn variable_encoding(
                 .cloned()
                 .flatten()
                 .ok_or_else(|| format!("sparse matrix '{path}' has no valid `shape` attribute"))?;
-            VarEncoding::Sparse(SparseMatrix {
+            Storage::Sparse(SparseMatrix {
                 major_axis: if encoding == "csr_matrix" { 0 } else { 1 },
                 data: join(path, "data"),
                 indices: join(path, "indices"),
@@ -273,11 +272,11 @@ pub fn variable_encoding(
 /// `path` is not one, or lies inside another. Its dimensions are named as in
 /// its table but read as integer positions, as for any one array read alone:
 /// one variable has no index to take names from.
-pub fn variable_group(
+pub fn variable_table(
     store: &ZarrStore,
     layout: &Layout,
     path: &str,
-) -> Result<Option<DimGroup>, Box<dyn std::error::Error>> {
+) -> Result<Option<Table>, Box<dyn std::error::Error>> {
     let is_variable = |g: &str| {
         layout
             .encoding_of(g)
@@ -290,26 +289,36 @@ pub fn variable_group(
         return Ok(None);
     }
     let encoding = layout.encoding_of(path).unwrap_or_default();
-    let Some(var_encoding) = variable_encoding(layout, path, &encoding)? else {
+    let Some(storage) = variable_storage(layout, path, &encoding)? else {
         return Ok(None);
     };
-    let (shape, chunk_shape) = match &var_encoding {
-        VarEncoding::Categorical { codes: values, .. } | VarEncoding::Nullable { values, .. } => {
+    let (shape, chunk_shape) = match &storage {
+        Storage::Sparse(matrix) => (matrix.shape.clone(), matrix.shape.clone()),
+        _ => {
+            let values = storage
+                .values_array(path)
+                .expect("an AnnData group variable");
             let arr = open_array(store, values)?;
             (arr.shape().to_vec(), first_chunk_shape(&arr)?)
         }
-        VarEncoding::Sparse(matrix) => (matrix.shape.clone(), matrix.shape.clone()),
     };
     let dims = axis_names(path, shape.len(), |g| layout.encoding_of(g))
         .unwrap_or_else(|| (0..shape.len()).map(|i| format!("dim_{i}")).collect());
-    Ok(Some(DimGroup {
-        dims,
-        shape,
-        chunk_shape,
-        data_var_names: vec![path.to_string()],
+    Ok(Some(Table {
+        dims: dims.clone(),
+        shape: shape.clone(),
+        chunk_shape: chunk_shape.clone(),
         coords: Vec::new(),
-        encodings: HashMap::from([(path.to_string(), var_encoding)]),
-        unreadable: Vec::new(),
+        variables: vec![Variable {
+            path: path.to_string(),
+            node: logical_node(node_of(path), |g| layout.encoding_of(g)),
+            dims: Some(dims),
+            shape,
+            chunk_shape,
+            attrs: Default::default(),
+            storage,
+            in_dataframe: layout.encoding_of(node_of(path)).as_deref() == Some("dataframe"),
+        }],
     }))
 }
 

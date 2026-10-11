@@ -3,7 +3,7 @@
 # group: [zarr]
 #
 # An AnnData store reads like any nested store (decision 8): one schema per
-# group, one table per dimension group. The AnnData layer (decision 9) names
+# group, one table per set of dimensions. The AnnData layer (decision 9) names
 # each element's axes (obs, var, ...), reads the obs and var data frames as
 # tables of the root group with their index as the coordinate, and reads
 # encoded groups as one column: categoricals as ENUMs, nullable columns with
@@ -66,7 +66,7 @@ obs cell_type n_genes batch donor
 statement error
 SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr');
 ----
-contains multiple dimension groups
+group '/' has 3 tables
 
 # Asking for the obs group points at the root.
 statement error

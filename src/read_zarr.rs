@@ -6,15 +6,16 @@ use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
 use zarrs::array::ArraySubset;
 
+use crate::selection::Selection;
 use crate::zarr_reader::anndata;
 use crate::zarr_reader::meta::{
-    array_path_group, build_column_defs, build_work_units, extract_file_system, first_chunk_shape,
+    array_path_table, build_column_defs, build_work_units, extract_file_system, first_chunk_shape,
     load_coord_array, open_array, open_store, ZarrArray, ZarrStore,
 };
 use crate::zarr_reader::sparse::{decode_block, plan_blocks, MajorRange, SparseBlock, SparseInput};
 use crate::zarr_reader::tree::{self, StoreTree};
 use crate::zarr_reader::types::{
-    ColumnDef, CoordArray, DimGroup, FixedValues, MaskedValues, SharedColumnValues, StringValues,
+    ColumnDef, CoordArray, FixedValues, MaskedValues, SharedColumnValues, StringValues, Table,
     WorkUnit, ZarrDtype,
 };
 
@@ -27,13 +28,13 @@ use crate::zarr_reader::types::{
 type RangeCache = HashMap<(String, u64), (Arc<MajorRange>, u64)>;
 
 pub struct ReadZarrBind {
-    pub group_shape: Vec<u64>,
-    pub group_chunk_shape: Vec<u64>,
+    pub table_shape: Vec<u64>,
+    pub table_chunk_shape: Vec<u64>,
     pub columns: Vec<ColumnDef>,
     pub coord_arrays: HashMap<String, CoordArray>,
     /// Pre-opened data-variable arrays; avoids O(n_chunks × n_vars) metadata reads.
     pub arrays: HashMap<String, ZarrArray>,
-    /// Data variables whose chunk shape differs from `group_chunk_shape`. They
+    /// Data variables whose chunk shape differs from `table_chunk_shape`. They
     /// are read as an array subset per work unit instead of one chunk.
     pub subset_reads: HashSet<String>,
     /// Pre-opened `mask` arrays of nullable variables, keyed by variable name.
@@ -131,24 +132,7 @@ impl VTab for ReadZarrVTab {
             .get_named_parameter("dims")
             .map(parse_dims_param)
             .transpose()?;
-        let array_path = bind
-            .get_named_parameter("array_path")
-            .map(|value| value.to_string());
-        let array_alias = bind
-            .get_named_parameter("array")
-            .map(|value| value.to_string());
-        if array_path.is_some() && array_alias.is_some() {
-            return Err("use either array_path= or \"array\"=, not both".into());
-        }
-        let requested_array = array_path.or(array_alias);
-        let requested_group = tree::group_param(bind)?;
-        if requested_group.is_some() && requested_array.is_some() {
-            return Err(
-                "use either group_path= or array_path=, not both; array_path= is relative to \
-                 the store root"
-                    .into(),
-            );
-        }
+        let selection = Selection::from_bind(bind)?;
 
         // Mirrors xarray.open_zarr's decode_times=: on by default, opt out to see
         // the raw CF offsets instead of TIMESTAMPs.
@@ -159,54 +143,56 @@ impl VTab for ReadZarrVTab {
 
         let fs = unsafe { extract_file_system(bind) };
         let store = open_store(&store_path, Some(fs))?;
-        if let Some(requested) = requested_array {
-            // Only this one array is needed. Listing requires consolidated metadata
-            // on remote stores, so here it is best-effort: when available it lets
-            // coordinate arrays be resolved; when not (e.g. an OME-Zarr store served
-            // over HTTP without consolidation) the array still reads by array_path,
-            // with dimensions synthesized as integer indices.
-            let array_names =
-                crate::zarr_reader::meta::list_array_names(&store_path, &store).unwrap_or_default();
-            let (array_name, group) = array_path_group(&store, &array_names, &requested)?;
-            if let Some(dims) = requested_dims {
-                if group.dims != dims {
-                    return Err(format!(
-                        "array '{array_name}' has dimensions {:?}, not {dims:?}",
-                        group.dims
-                    )
-                    .into());
+        let node = match selection {
+            Selection::Array(requested) => {
+                // Only this one array is needed. Listing requires consolidated
+                // metadata on remote stores, so here it is best-effort: when
+                // available it lets coordinate arrays be resolved; when not (e.g.
+                // an OME-Zarr store served over HTTP without consolidation) the
+                // array still reads by array_path, with dimensions synthesized as
+                // integer indices.
+                let array_names = crate::zarr_reader::meta::list_array_names(&store_path, &store)
+                    .unwrap_or_default();
+                let (array_name, table) = array_path_table(&store, &array_names, &requested)?;
+                if let Some(dims) = requested_dims {
+                    if table.dims != dims {
+                        return Err(format!(
+                            "array '{array_name}' has dimensions {:?}, not {dims:?}",
+                            table.dims
+                        )
+                        .into());
+                    }
                 }
+                return finish_bind(bind, store, &table, decode_times, ColumnNames::ArrayPath);
             }
-            return finish_bind(bind, store, &group, decode_times, ColumnNames::ArrayPath);
-        }
+            // One node (Zarr group) of the store, the root unless group_path=
+            // says otherwise, as in xarray.open_zarr (design decision 8).
+            Selection::Node(node) => node,
+            Selection::Store => String::new(),
+        };
 
         let array_names = crate::zarr_reader::meta::list_array_names(&store_path, &store)?;
         if array_names.is_empty() {
             return Err(format!("no Zarr arrays found in '{store_path}'").into());
         }
 
-        // One node (Zarr group) of the store, the root unless group_path= says
-        // otherwise, as in xarray.open_zarr (design decision 8).
-        let node = requested_group.unwrap_or_default();
         let shown = tree::display_group(&node);
         tree::ensure_group_exists(&store_path, &array_names, &node)?;
         let store_tree = StoreTree::load_for_node(&store, &array_names, &node)?;
         anndata::check_group_path(&store_path, store_tree.layout.as_ref(), &node)?;
-        let node_groups = store_tree.dim_groups(&node);
-        if let Some(msg) = node_groups.misaligned {
+        let node_tables = store_tree.tables(&node);
+        if let Some(msg) = node_tables.misaligned {
             return Err(msg.into());
         }
-        let dim_groups = &node_groups.groups;
+        let tables = &node_tables.tables;
 
-        if dim_groups.is_empty() {
-            // AnnData's obs and var columns are read from the root group, and
-            // raw/var's from raw (decision 9).
+        if tables.is_empty() {
             let mut msg = format!("'{store_path}': no data variables in group '{shown}'");
-            if !node_groups.unnamed.is_empty() {
+            if !node_tables.unnamed.is_empty() {
                 msg.push_str(&format!(
                     "; these arrays declare no dimension names: {:?}. Read one with \
                      array_path=, which names its dimensions dim_0, dim_1 and so on",
-                    node_groups.unnamed
+                    node_tables.unnamed
                 ));
             }
             msg.push_str(&format!(
@@ -217,7 +203,7 @@ impl VTab for ReadZarrVTab {
         }
 
         let available = || {
-            let mut dims: Vec<&Vec<String>> = dim_groups.iter().map(|g| &g.dims).collect();
+            let mut dims: Vec<&Vec<String>> = tables.iter().map(|t| &t.dims).collect();
             dims.dedup();
             dims
         };
@@ -227,32 +213,34 @@ impl VTab for ReadZarrVTab {
                 let distinct = available();
                 if distinct.len() > 1 {
                     return Err(format!(
-                        "'{store_path}': group '{shown}' contains multiple dimension groups ({}) \
-                         {distinct:?}; use dims= to select a compatible group or array_path= to \
-                         select one array",
+                        "'{store_path}': group '{shown}' has {} tables {distinct:?}; use dims= \
+                         to select one, or array_path= to read one array",
                         distinct.len()
                     )
                     .into());
                 }
-                &dim_groups[0].dims
+                &tables[0].dims
             }
         };
-        let matching: Vec<&DimGroup> = dim_groups.iter().filter(|g| g.dims == wanted).collect();
-        let group = match matching.as_slice() {
+        let matching: Vec<&Table> = tables.iter().filter(|t| t.dims == wanted).collect();
+        let table = match matching.as_slice() {
             [] => {
                 return Err(format!(
-                    "'{store_path}': no dimension group matches dims={wanted:?} in group \
-                     '{shown}'; available: {:?}",
+                    "'{store_path}': no table in group '{shown}' has dims={wanted:?}; \
+                     available: {:?}",
                     available()
                 )
                 .into())
             }
-            [group] => *group,
+            [table] => *table,
             [a, b, ..] => {
                 return Err(format!(
-                    "array shape mismatch in dim group {wanted:?}: {:?} {:?} vs {:?} {:?}; \
-                     use array_path= to select one array",
-                    a.data_var_names, a.shape, b.data_var_names, b.shape
+                    "arrays of different shapes share dims {wanted:?}: {:?} {:?} vs {:?} {:?}; \
+                     use array_path= to read one array",
+                    a.variable_paths(),
+                    a.shape,
+                    b.variable_paths(),
+                    b.shape
                 )
                 .into());
             }
@@ -260,9 +248,9 @@ impl VTab for ReadZarrVTab {
 
         // Leaving an array out would return the table without it and no sign
         // that it is missing.
-        if !group.unreadable.is_empty() {
-            let names: Vec<&str> = group.unreadable.iter().map(|(p, _)| p.as_str()).collect();
-            let (first, err) = &group.unreadable[0];
+        let unreadable = table.unreadable();
+        if let Some(&(first, err)) = unreadable.first() {
+            let names: Vec<&str> = unreadable.iter().map(|&(p, _)| p).collect();
             return Err(format!(
                 "'{store_path}': zarrs cannot open {names:?}, which belong to the table \
                  {wanted:?} in group '{shown}' ('{first}': {err}); read the other arrays one \
@@ -270,7 +258,7 @@ impl VTab for ReadZarrVTab {
             )
             .into());
         }
-        finish_bind(bind, store, group, decode_times, ColumnNames::Basename)
+        finish_bind(bind, store, table, decode_times, ColumnNames::Basename)
     }
 
     fn supports_pushdown() -> bool {
@@ -352,7 +340,7 @@ impl VTab for ReadZarrVTab {
                 let wu = &bind.work_units[unit_idx];
                 // Decode chunk for each data variable.
                 let chunk_values = decode_work_unit(bind, wu, projected)?;
-                let chunk_rows = compute_chunk_rows(wu, &bind.group_shape, &bind.group_chunk_shape);
+                let chunk_rows = compute_chunk_rows(wu, &bind.table_shape, &bind.table_chunk_shape);
                 state.current_unit_idx = unit_idx;
                 state.current_chunk_values = chunk_values;
                 state.row_cursor = 0;
@@ -389,8 +377,8 @@ impl VTab for ReadZarrVTab {
                 &bind.columns,
                 &bind.coord_arrays,
                 wu,
-                &bind.group_shape,
-                &bind.group_chunk_shape,
+                &bind.table_shape,
+                &bind.table_chunk_shape,
                 &state.current_chunk_values,
                 output,
                 rows_written,
@@ -417,11 +405,9 @@ impl VTab for ReadZarrVTab {
                 "dims".to_string(),
                 LogicalTypeHandle::list(&LogicalTypeId::Varchar.into()),
             ),
-            ("array".to_string(), LogicalTypeId::Varchar.into()),
-            ("array_path".to_string(), LogicalTypeId::Varchar.into()),
             ("decode_times".to_string(), LogicalTypeId::Boolean.into()),
         ];
-        params.extend(crate::zarr_reader::tree::group_named_parameters());
+        params.extend(Selection::named_parameters());
         Some(params)
     }
 }
@@ -451,7 +437,7 @@ fn parse_dims_param(value: Value) -> Result<Vec<String>, Box<dyn std::error::Err
 /// How data-variable columns are named.
 #[derive(Clone, Copy, PartialEq)]
 enum ColumnNames {
-    /// The variable's name within its group, as in xarray (`foo`, not `a/b/foo`).
+    /// The variable's name within its node, as in xarray (`foo`, not `a/b/foo`).
     Basename,
     /// One array selected by `array_path=`: its store-relative path.
     ArrayPath,
@@ -460,29 +446,31 @@ enum ColumnNames {
 fn finish_bind(
     bind: &BindInfo,
     store: ZarrStore,
-    group: &DimGroup,
+    table: &Table,
     decode_times: bool,
     names: ColumnNames,
 ) -> Result<ReadZarrBind, Box<dyn std::error::Error>> {
-    if group.mixes_sparse_storage() {
+    if table.mixes_sparse_storage() {
+        let paths = table.variable_paths();
         return Err(format!(
-            "sparse matrices {:?} are stored partly as CSR and partly as CSC, so their stored \
-             entries cannot be read as one table; read each alone with array_path := '{}'",
-            group.data_var_names, group.data_var_names[0]
+            "sparse matrices {paths:?} are stored partly as CSR and partly as CSC, so their \
+             stored entries cannot be read as one table; read each alone with array_path := \
+             '{}'",
+            paths[0]
         )
         .into());
     }
     // Load coord arrays.
     let mut coord_arrays: HashMap<String, CoordArray> = HashMap::new();
-    for (dim, coord_name) in &group.coords {
+    for (dim, coord_name) in &table.coords {
         let ca = load_coord_array(&store, coord_name, decode_times)?;
         coord_arrays.insert(dim.clone(), ca);
     }
 
-    let columns = build_column_defs(&store, group, &coord_arrays, decode_times)?;
+    let columns = build_column_defs(&store, table, &coord_arrays, decode_times)?;
 
-    // Register output columns with DuckDB. A group read names each data column
-    // after the variable's name within the group. When a single array's name is a
+    // Register output columns with DuckDB. A table read names each data column
+    // after the variable's name within its node. When a single array's name is a
     // numeric level (`0`) or, for array_path=, a nested store-relative path
     // (`labels/nuclei/0`), surface that value column as `value` so callers don't
     // have to double-quote it. Decoding still keys off `col.name`.
@@ -491,7 +479,7 @@ fn finish_bind(
     // name equals, ignoring case, a dimension of the table (an AnnData obs
     // column called `obs` or `Obs`) or an earlier column (`A` and `a`) keeps its
     // store path instead (`obs/obs`), as array_path= names it.
-    let mut used: HashSet<String> = group.dims.iter().map(|d| d.to_lowercase()).collect();
+    let mut used: HashSet<String> = table.dims.iter().map(|d| d.to_lowercase()).collect();
     for col in &columns {
         let duckdb_type = col.on_disk_dtype.to_duckdb_type(&col.encoding);
         let basename = tree::basename(&col.name);
@@ -527,21 +515,24 @@ fn finish_bind(
     let mut sparse: HashMap<String, SparseInput> = HashMap::new();
     let mut subset_reads = HashSet::new();
     for col in columns.iter().filter(|c| !c.is_coord) {
-        if let Some(matrix) = &col.sparse {
+        if let Some(matrix) = col.storage.sparse() {
             sparse.insert(
                 col.name.clone(),
                 SparseInput::open(&store, &col.name, matrix)?,
             );
             continue;
         }
-        let source = col.source.as_deref().unwrap_or(&col.name);
+        let source = col
+            .storage
+            .values_array(&col.name)
+            .ok_or_else(|| format!("'{}' has no array to read", col.name))?;
         let arr = open_array(&store, source)?;
-        let mut chunked_like_plan = first_chunk_shape(&arr)? == group.chunk_shape;
+        let mut chunked_like_plan = first_chunk_shape(&arr)? == table.chunk_shape;
         arrays.insert(col.name.clone(), arr);
-        if let Some(mask) = &col.mask {
+        if let Some(mask) = col.storage.mask() {
             let mask = open_array(&store, mask)?;
             // A mask is read the same way as its values, so both share a layout.
-            chunked_like_plan &= first_chunk_shape(&mask)? == group.chunk_shape;
+            chunked_like_plan &= first_chunk_shape(&mask)? == table.chunk_shape;
             masks.insert(col.name.clone(), mask);
         }
         if !chunked_like_plan {
@@ -552,7 +543,7 @@ fn finish_bind(
     // A table of sparse matrices only has one row per stored entry, read in
     // blocks of the major axis. Every matrix must be stored the same way.
     let mut sparse_major_axis = 0;
-    let sparse_blocks = if group.is_sparse() {
+    let sparse_blocks = if table.is_sparse() {
         let inputs = sparse_inputs(&columns, &sparse);
         sparse_major_axis = inputs[0].matrix.major_axis;
         Some(plan_blocks(&inputs, SPARSE_BLOCK_ENTRIES))
@@ -560,7 +551,7 @@ fn finish_bind(
         None
     };
 
-    let mut work_units = build_work_units(group);
+    let mut work_units = build_work_units(table);
     // Work units run roughly in order, and the decoded range of a sparse matrix
     // is kept until every unit across it has run (`sparse_ranges`). That bounds
     // memory to a few ranges only for a matrix whose major axis is the outer
@@ -578,8 +569,8 @@ fn finish_bind(
     }
 
     Ok(ReadZarrBind {
-        group_shape: group.shape.clone(),
-        group_chunk_shape: group.chunk_shape.clone(),
+        table_shape: table.shape.clone(),
+        table_chunk_shape: table.chunk_shape.clone(),
         columns,
         coord_arrays,
         arrays,
@@ -637,7 +628,7 @@ fn decode_work_unit(
     projected: &HashMap<usize, usize>,
 ) -> Result<HashMap<String, UnitValues>, Box<dyn std::error::Error>> {
     let mut chunk_values = HashMap::new();
-    let region = unit_region(wu, &bind.group_shape, &bind.group_chunk_shape);
+    let region = unit_region(wu, &bind.table_shape, &bind.table_chunk_shape);
 
     for (col_idx, col) in bind.columns.iter().enumerate() {
         if col.is_coord {
@@ -650,11 +641,11 @@ fn decode_work_unit(
             let origin: Vec<u64> = wu
                 .chunk_indices
                 .iter()
-                .zip(&bind.group_chunk_shape)
+                .zip(&bind.table_chunk_shape)
                 .map(|(i, c)| i * c)
                 .collect();
             let range = sparse_range(bind, &col.name, input, &origin)?;
-            let bytes = input.dense_chunk(&range, &origin, &bind.group_chunk_shape);
+            let bytes = input.dense_chunk(&range, &origin, &bind.table_chunk_shape);
             let values =
                 FixedValues::new(bytes, input.dtype.clone(), col.encoding.clone(), None)
                     .ok_or_else(|| format!("sparse matrix '{}' is not fixed-width", col.name))?;
@@ -747,14 +738,14 @@ fn sparse_range(
     let major = input.matrix.major_axis;
     let minor = 1 - major;
     let m0 = origin[major];
-    let m1 = (m0 + bind.group_chunk_shape[major]).min(bind.group_shape[major]);
+    let m1 = (m0 + bind.table_chunk_shape[major]).min(bind.table_shape[major]);
     // Stored the other way from the unit order, the units across one range
     // are spread over the whole scan, so caching it would keep every range of
     // the matrix in memory at once.
     if major != bind.cached_major_axis {
         return Ok(Arc::new(input.major_range(m0, m1)?));
     }
-    let uses = bind.group_shape[minor].div_ceil(bind.group_chunk_shape[minor]);
+    let uses = bind.table_shape[minor].div_ceil(bind.table_chunk_shape[minor]);
     let key = (name.to_string(), m0);
     // Count one use of the cached range; drop it after the last.
     let take = |cache: &mut RangeCache| {
@@ -801,8 +792,8 @@ fn fill_chunk_slice(
     col_defs: &[ColumnDef],
     coord_arrays: &HashMap<String, CoordArray>,
     wu: &WorkUnit,
-    group_shape: &[u64],
-    group_chunk_shape: &[u64],
+    table_shape: &[u64],
+    table_chunk_shape: &[u64],
     chunk_values: &HashMap<String, UnitValues>,
     output: &mut DataChunkHandle,
     vector_base: usize,
@@ -816,14 +807,14 @@ fn fill_chunk_slice(
     // Used to determine the number of valid rows and to map flat_row → dim_indices.
     let chunk_shape: Vec<usize> = (0..ndim)
         .map(|k| {
-            let origin = wu.chunk_indices[k] * group_chunk_shape[k];
-            let remaining = group_shape[k] - origin;
-            remaining.min(group_chunk_shape[k]) as usize
+            let origin = wu.chunk_indices[k] * table_chunk_shape[k];
+            let remaining = table_shape[k] - origin;
+            remaining.min(table_chunk_shape[k]) as usize
         })
         .collect();
 
     let chunk_origin: Vec<usize> = (0..ndim)
-        .map(|k| (wu.chunk_indices[k] * group_chunk_shape[k]) as usize)
+        .map(|k| (wu.chunk_indices[k] * table_chunk_shape[k]) as usize)
         .collect();
 
     // Logical strides: map flat_row → per-dim indices within the logical chunk.
@@ -833,8 +824,8 @@ fn fill_chunk_slice(
     }
 
     // Physical (zarrs) strides: zarrs always returns full-chunk-size bytes, including
-    // fill-value padding for boundary chunks. Use group_chunk_shape for byte offset math.
-    let zarrs_shape: Vec<usize> = (0..ndim).map(|k| group_chunk_shape[k] as usize).collect();
+    // fill-value padding for boundary chunks. Use table_chunk_shape for byte offset math.
+    let zarrs_shape: Vec<usize> = (0..ndim).map(|k| table_chunk_shape[k] as usize).collect();
     let mut zarrs_strides = vec![1usize; ndim];
     for k in (0..ndim.saturating_sub(1)).rev() {
         zarrs_strides[k] = zarrs_strides[k + 1] * zarrs_shape[k + 1];

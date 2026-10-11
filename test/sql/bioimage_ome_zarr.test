@@ -42,7 +42,7 @@ WHERE c = 0 AND y < 2 AND x < 2;
 ----
 4	14
 
-# The OME-Zarr array is discoverable as one c/y/x dimension group.
+# The OME-Zarr array is discoverable as one c/y/x table.
 query II rowsort
 SELECT dims, data_vars
 FROM read_zarr_groups('test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr');

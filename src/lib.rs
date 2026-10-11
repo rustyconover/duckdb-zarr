@@ -5,6 +5,7 @@ mod read_zarr;
 mod read_zarr_groups;
 mod read_zarr_metadata;
 mod replacement_scan;
+mod selection;
 mod zarr_reader;
 
 unsafe fn zarr_init_c_api_internal(

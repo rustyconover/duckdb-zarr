@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use duckdb::core::{FlatVector, LogicalTypeHandle, LogicalTypeId};
@@ -194,72 +193,57 @@ pub enum FillSentinel {
 /// Describes one output column (either a dim coord or a data variable).
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
-    /// The variable's store-relative path. For an AnnData-encoded variable this
-    /// is the group's path (`obs/cell_type`), not the path of the array that
-    /// holds its values.
+    /// The variable's store-relative path, or the dimension's name for a
+    /// dimension column.
     pub name: String,
-    /// The array that holds the values (or codes), when it differs from `name`.
-    pub source: Option<String>,
-    /// An array of the same shape and chunks whose `true` entries are missing
-    /// values (AnnData `nullable-*`).
-    pub mask: Option<String>,
-    /// For a sparse variable read into a dense table: how to scatter it.
-    pub sparse: Option<SparseMatrix>,
+    /// How the variable's values are stored ([`Storage::Array`] for a
+    /// dimension column, whose values are pre-loaded).
+    pub storage: Storage,
     pub on_disk_dtype: ZarrDtype,
     pub encoding: ColumnEncoding,
     pub sentinel: Option<FillSentinel>,
     pub is_coord: bool,
-    /// For coord columns: the dimension index this coord maps to in group.dims.
-    /// None for data variable columns.
+    /// For coord columns: the dimension index this coord maps to in the
+    /// table's dims. None for data variable columns.
     pub dim_idx: Option<usize>,
 }
 
-/// One dim group: arrays sharing an identical ordered dimension set.
+/// A variable of a node, as xarray reads it: values over named dimensions.
 #[derive(Debug, Clone)]
-pub struct DimGroup {
-    pub dims: Vec<String>,
+pub struct Variable {
+    /// Store-relative path, for example `simulation/fine/foo`. For a variable
+    /// stored as a group of arrays (AnnData), the group's path.
+    pub path: String,
+    /// The node whose tables hold the variable: the group that holds it,
+    /// except for AnnData's `obs`, `var` and `raw/var` columns, which belong to
+    /// the parent group (see [`super::anndata::logical_node`]).
+    pub node: String,
+    /// Dimension names the store records or the AnnData layout gives, or
+    /// `None` when there are none.
+    pub dims: Option<Vec<String>>,
     pub shape: Vec<u64>,
+    /// The chunk shape of the array that holds the values. A sparse matrix's
+    /// is its shape.
     pub chunk_shape: Vec<u64>,
-    pub data_var_names: Vec<String>,
-    /// `(dim, array path)` for each dimension that has a coordinate.
-    pub coords: Vec<(String, String)>,
-    /// Data variables stored as a group of arrays (AnnData encodings), keyed by
-    /// path. Variables not listed here are plain arrays.
-    pub encodings: HashMap<String, VarEncoding>,
-    /// Arrays of this table that zarrs cannot open (unsupported data type or
-    /// codec), with the error. `read_zarr` fails on such a table rather than
-    /// return it without them.
-    pub unreadable: Vec<(String, String)>,
+    pub attrs: serde_json::Map<String, serde_json::Value>,
+    pub storage: Storage,
+    /// Whether the variable is a column of an AnnData data frame. The frame's
+    /// index is the coordinate of its axis, so no column is one, even a column
+    /// named like the axis.
+    pub in_dataframe: bool,
 }
 
-impl DimGroup {
-    /// Whether this is a table of sparse matrices only, some stored as CSR and
-    /// some as CSC. Its stored entries cannot be read in blocks of one major
-    /// axis, so `read_zarr` cannot read it as one table.
-    pub fn mixes_sparse_storage(&self) -> bool {
-        let mut axes = self.encodings.values().filter_map(|e| match e {
-            VarEncoding::Sparse(m) => Some(m.major_axis),
-            _ => None,
-        });
-        let first = axes.next();
-        self.is_sparse() && axes.any(|a| Some(a) != first)
-    }
-
-    /// Whether every data variable is a sparse matrix. Such a table has one row
-    /// per stored entry instead of one per cell.
-    pub fn is_sparse(&self) -> bool {
-        !self.data_var_names.is_empty()
-            && self
-                .data_var_names
-                .iter()
-                .all(|name| matches!(self.encodings.get(name), Some(VarEncoding::Sparse(_))))
-    }
-}
-
-/// A variable stored as a group of arrays, as AnnData writes them
+/// How a variable's values are stored: one Zarr array, or a group of arrays
+/// as AnnData writes them
 /// (<https://anndata.readthedocs.io/en/stable/fileformat-prose.html>).
 #[derive(Debug, Clone)]
-pub enum VarEncoding {
+pub enum Storage {
+    /// One Zarr array at the variable's path.
+    Array,
+    /// One Zarr array that zarrs cannot open (unsupported data type or codec),
+    /// with the error. Its shape and names come from its raw metadata document,
+    /// so that its table can say it is missing instead of leaving it out.
+    Unreadable { error: String },
     /// `categorical`: integer `codes` into a 1-D `categories` array.
     Categorical { codes: String, categories: String },
     /// `nullable-integer`, `nullable-boolean`, `nullable-string-array`:
@@ -267,6 +251,95 @@ pub enum VarEncoding {
     Nullable { values: String, mask: String },
     /// `csr_matrix` / `csc_matrix`.
     Sparse(SparseMatrix),
+}
+
+impl Storage {
+    /// The array the scan reads chunk by chunk for a variable at `path`: the
+    /// array itself, a categorical's codes or a nullable column's values.
+    /// `None` for a sparse matrix, which is read through its own arrays, and
+    /// for an unreadable array.
+    pub fn values_array<'a>(&'a self, path: &'a str) -> Option<&'a str> {
+        match self {
+            Storage::Array => Some(path),
+            Storage::Categorical { codes, .. } => Some(codes),
+            Storage::Nullable { values, .. } => Some(values),
+            Storage::Unreadable { .. } | Storage::Sparse(_) => None,
+        }
+    }
+
+    /// A nullable column's mask.
+    pub fn mask(&self) -> Option<&str> {
+        match self {
+            Storage::Nullable { mask, .. } => Some(mask),
+            _ => None,
+        }
+    }
+
+    pub fn sparse(&self) -> Option<&SparseMatrix> {
+        match self {
+            Storage::Sparse(matrix) => Some(matrix),
+            _ => None,
+        }
+    }
+}
+
+/// A table: the variables of one node that share dimension names and shape,
+/// read as one DuckDB table (decision 8; older sections of the design call it
+/// a dimension group). It has one column per dimension and one per variable.
+/// Its rows are the cells its variables store: every cell of `shape`, or, for
+/// a table of sparse matrices only, their stored entries (decision 9).
+#[derive(Debug, Clone)]
+pub struct Table {
+    pub dims: Vec<String>,
+    pub shape: Vec<u64>,
+    /// The grid work units follow: the largest chunk length in each dimension
+    /// over the variables read chunk by chunk (decision 6).
+    pub chunk_shape: Vec<u64>,
+    /// `(dimension, path)` of the coordinate array of each dimension that has
+    /// one, possibly inherited from an ancestor node.
+    pub coords: Vec<(String, String)>,
+    pub variables: Vec<Variable>,
+}
+
+impl Table {
+    /// The paths of the table's variables, in column order.
+    pub fn variable_paths(&self) -> Vec<&str> {
+        self.variables.iter().map(|v| v.path.as_str()).collect()
+    }
+
+    /// `(path, error)` for each variable zarrs cannot open. `read_zarr` fails
+    /// on a table that has any.
+    pub fn unreadable(&self) -> Vec<(&str, &str)> {
+        self.variables
+            .iter()
+            .filter_map(|v| match &v.storage {
+                Storage::Unreadable { error } => Some((v.path.as_str(), error.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether every variable is a sparse matrix. Such a table has one row per
+    /// stored entry instead of one per cell.
+    pub fn is_sparse(&self) -> bool {
+        !self.variables.is_empty()
+            && self
+                .variables
+                .iter()
+                .all(|v| matches!(v.storage, Storage::Sparse(_)))
+    }
+
+    /// Whether this is a table of sparse matrices only, some stored as CSR and
+    /// some as CSC. Its stored entries cannot be read in blocks of one major
+    /// axis, so `read_zarr` cannot read it as one table.
+    pub fn mixes_sparse_storage(&self) -> bool {
+        let mut axes = self
+            .variables
+            .iter()
+            .filter_map(|v| v.storage.sparse().map(|m| m.major_axis));
+        let first = axes.next();
+        self.is_sparse() && axes.any(|a| Some(a) != first)
+    }
 }
 
 /// A compressed sparse matrix: `data` and `indices` hold the stored entries,

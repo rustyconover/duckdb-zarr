@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use duckdb::core::LogicalTypeId;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
+use crate::selection::Selection;
 use crate::zarr_reader::meta::{
     array_path_dims, cf_auxiliary_vars, dimension_names as get_dim_names, extract_file_system,
     is_unsupported_array_error, list_array_names, open_array, open_store, select_array_name,
@@ -59,49 +60,37 @@ impl VTab for ReadZarrMetaVTab {
         let fs = unsafe { extract_file_system(bind) };
         let store = open_store(&store_path, Some(fs))?;
         let mut array_names = list_array_names(&store_path, &store)?;
-        let array_path = bind
-            .get_named_parameter("array_path")
-            .map(|value| value.to_string());
-        let array_alias = bind
-            .get_named_parameter("array")
-            .map(|value| value.to_string());
-        if array_path.is_some() && array_alias.is_some() {
-            return Err("use either array_path= or \"array\"=, not both".into());
-        }
-        let requested_group = tree::group_param(bind)?;
-        let requested_array = array_path.or(array_alias);
-        if requested_group.is_some() && requested_array.is_some() {
-            return Err("use either group_path= or array_path=, not both".into());
-        }
-        if let Some(requested) = requested_array {
-            // An AnnData encoded variable lists the arrays it is made of.
-            let prefix = format!("{}/", requested.trim().trim_matches('/'));
-            let encoded = !array_names.iter().any(|n| format!("{n}/") == prefix)
-                && array_names.iter().any(|n| n.starts_with(&prefix))
-                && anndata::layout(&store, &array_names).is_some_and(|layout| {
-                    layout
-                        .encoding_of(prefix.trim_end_matches('/'))
-                        .is_some_and(|e| anndata::is_variable_encoding(&e))
-                });
-            if encoded {
-                array_names.retain(|n| n.starts_with(&prefix));
-            } else {
-                array_names = vec![select_array_name(&array_names, &requested)?];
-            }
-        }
-        // group_path= lists the arrays of that node's tables, not of its
-        // subgroups. In an AnnData store that is the node read_zarr reads each
-        // array's variable from: the obs and var columns are in the root, and the
-        // arrays of an encoded group (X/data, obs/cell_type/codes) go with it.
         // The AnnData layout (None for other stores), read once for all arrays.
         let layout = anndata::layout(&store, &array_names);
-        if let Some(node) = requested_group {
-            tree::ensure_group_exists(&store_path, &array_names, &node)?;
-            anndata::check_group_path(&store_path, layout.as_ref(), &node)?;
-            match &layout {
-                Some(layout) => array_names.retain(|name| layout.node_of_array(name) == node),
-                None => array_names.retain(|name| tree::node_of(name) == node),
+        match Selection::from_bind(bind)? {
+            Selection::Array(requested) => {
+                // An AnnData encoded variable lists the arrays it is made of.
+                let is_variable = layout.as_ref().is_some_and(|layout| {
+                    layout
+                        .encoding_of(&requested)
+                        .is_some_and(|e| anndata::is_variable_encoding(&e))
+                });
+                if is_variable {
+                    let prefix = format!("{requested}/");
+                    array_names.retain(|name| name.starts_with(&prefix));
+                } else {
+                    array_names = vec![select_array_name(&array_names, &requested)?];
+                }
             }
+            // group_path= lists the arrays of that node's tables, not of its
+            // subgroups. In an AnnData store that is the node read_zarr reads
+            // each array's variable from: the obs and var columns are in the
+            // root, and the arrays of an encoded group (X/data,
+            // obs/cell_type/codes) go with it.
+            Selection::Node(node) => {
+                tree::ensure_group_exists(&store_path, &array_names, &node)?;
+                anndata::check_group_path(&store_path, layout.as_ref(), &node)?;
+                match &layout {
+                    Some(layout) => array_names.retain(|name| layout.node_of_array(name) == node),
+                    None => array_names.retain(|name| tree::node_of(name) == node),
+                }
+            }
+            Selection::Store => {}
         }
 
         // Open every array once. One with a data type or codec that zarrs cannot
@@ -245,11 +234,6 @@ impl VTab for ReadZarrMetaVTab {
     }
 
     fn named_parameters() -> Option<Vec<(String, duckdb::core::LogicalTypeHandle)>> {
-        let mut params = vec![
-            ("array".to_string(), LogicalTypeId::Varchar.into()),
-            ("array_path".to_string(), LogicalTypeId::Varchar.into()),
-        ];
-        params.extend(crate::zarr_reader::tree::group_named_parameters());
-        Some(params)
+        Some(Selection::named_parameters())
     }
 }

@@ -1,8 +1,8 @@
 //! Nested Zarr groups as a tree of tables (design decision 8).
 //!
-//! Each Zarr group is a node, as in `xarray.DataTree`. A table is one dimension
-//! group inside one node: arrays in different nodes never share a table, even
-//! when their dimension names match. A node's tables use coordinate arrays from
+//! Each Zarr group is a node, as in `xarray.DataTree`. A table is the set of a
+//! node's variables that share dimension names and shape: variables in
+//! different nodes never share a table, even when their dimension names match. A node's tables use coordinate arrays from
 //! the node itself or, failing that, from its nearest ancestor that has one.
 //! Tables are named the way xarray-sql names them (`"_".join(dims)`), and each
 //! node maps to one DuckDB schema (the root is `main`).
@@ -14,39 +14,12 @@ use super::meta::{
     cf_auxiliary_vars, declared_dims, first_chunk_shape, is_unsupported_array_error, open_array,
     raw_array_layout, ArrayFacts, ZarrStore,
 };
-use super::types::{DimGroup, VarEncoding};
+use super::types::{Storage, Table, Variable};
 
-/// One array in a node, with the metadata that grouping needs.
-#[derive(Debug, Clone)]
-pub struct NodeVar {
-    /// Store-relative path, for example `simulation/fine/foo`.
-    pub path: String,
-    /// The node (group path) the variable belongs to: the group that holds it,
-    /// except for AnnData's `obs`, `var` and `raw/var` columns, which belong
-    /// to the parent group (see [`anndata::logical_node`]).
-    pub node: String,
-    /// Dimension names the store records, or `None` when it records none.
-    pub dims: Option<Vec<String>>,
-    pub shape: Vec<u64>,
-    pub chunk_shape: Vec<u64>,
-    pub attrs: serde_json::Map<String, serde_json::Value>,
-    /// Why zarrs cannot open the array (unsupported data type or codec), if it
-    /// cannot. Its shape and names then come from the raw metadata document,
-    /// so that the table it belongs to can say it is missing.
-    pub unreadable: Option<String>,
-    /// How a variable stored as a group of arrays is decoded; `None` for a
-    /// plain array. A sparse matrix's `chunk_shape` is its shape.
-    pub encoding: Option<VarEncoding>,
-    /// Whether the array is a column of an AnnData data frame. The frame's
-    /// index is the coordinate of its axis, so no column is one, even a column
-    /// named like the axis.
-    pub in_dataframe: bool,
-}
-
-/// The arrays of the nodes that were loaded, keyed by store-relative path.
+/// The variables of the nodes that were loaded, keyed by store-relative path.
 #[derive(Debug, Default)]
 pub struct StoreTree {
-    pub vars: BTreeMap<String, NodeVar>,
+    pub variables: BTreeMap<String, Variable>,
     /// Coordinates by `(node, dim)`: the array that holds the values, and its
     /// length. A dimension coordinate (a 1-D array named after its only
     /// dimension) is registered in its node; so is an AnnData data frame's
@@ -59,31 +32,6 @@ pub struct StoreTree {
     /// either. They are left out of every table; `read_zarr_metadata` lists
     /// them.
     pub unsupported: Vec<String>,
-}
-
-/// The node selected by a table function's `group_path=` parameter, or by its
-/// quoted alias `"group"=` (xarray's name; `GROUP` is a DuckDB keyword, so the
-/// quotes are required).
-pub fn group_param(
-    bind: &duckdb::vtab::BindInfo,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let path = bind.get_named_parameter("group_path");
-    let alias = bind.get_named_parameter("group");
-    if path.is_some() && alias.is_some() {
-        return Err("use either group_path= or \"group\"=, not both".into());
-    }
-    Ok(path
-        .or(alias)
-        .map(|value| normalize_group(&value.to_string())))
-}
-
-/// The named parameters that [`group_param`] reads.
-pub fn group_named_parameters() -> Vec<(String, duckdb::core::LogicalTypeHandle)> {
-    use duckdb::core::LogicalTypeId;
-    vec![
-        ("group_path".to_string(), LogicalTypeId::Varchar.into()),
-        ("group".to_string(), LogicalTypeId::Varchar.into()),
-    ]
 }
 
 /// Normalize a user-supplied group path: `'/a/b/'` and `'a/b'` are the same
@@ -149,7 +97,7 @@ pub fn default_table_name(dims: &[String]) -> String {
 impl StoreTree {
     /// Open the arrays in `nodes` (all arrays when `None`) and record their
     /// metadata. An array zarrs cannot open is recorded with its error
-    /// ([`NodeVar::unreadable`]), or in `unsupported` if even its metadata
+    /// ([`Storage::Unreadable`]), or in `unsupported` if even its metadata
     /// document cannot be read; any other open error fails.
     pub fn load(
         store: &ZarrStore,
@@ -189,9 +137,9 @@ impl StoreTree {
                 Err(err) if is_unsupported_array_error(err.as_ref()) => {
                     match raw_array_layout(store, name) {
                         Some((shape, dims)) => {
-                            tree.vars.insert(
+                            tree.variables.insert(
                                 name.clone(),
-                                NodeVar {
+                                Variable {
                                     path: name.clone(),
                                     node: logical(name),
                                     dims: dims.or_else(|| {
@@ -200,8 +148,9 @@ impl StoreTree {
                                     chunk_shape: shape.clone(),
                                     shape,
                                     attrs: Default::default(),
-                                    unreadable: Some(err.to_string()),
-                                    encoding: None,
+                                    storage: Storage::Unreadable {
+                                        error: err.to_string(),
+                                    },
                                     in_dataframe: in_dataframe(name),
                                 },
                             );
@@ -216,17 +165,16 @@ impl StoreTree {
             let chunk_shape = first_chunk_shape(&arr)?;
             let dims = declared_dims(store, &arr, name)
                 .or_else(|| anndata::axis_names(name, shape.len(), encoding_of));
-            tree.vars.insert(
+            tree.variables.insert(
                 name.clone(),
-                NodeVar {
+                Variable {
                     path: name.clone(),
                     node: logical(name),
                     dims,
                     shape,
                     chunk_shape,
                     attrs: arr.attributes().clone(),
-                    unreadable: None,
-                    encoding: None,
+                    storage: Storage::Array,
                     in_dataframe: in_dataframe(name),
                 },
             );
@@ -240,35 +188,37 @@ impl StoreTree {
             if !is_variable_group(group) || !wanted(group) || inside_variable(group) {
                 continue;
             }
-            let Some(var_encoding) = anndata::variable_encoding(anndata_layout, group, encoding)?
-            else {
+            let Some(storage) = anndata::variable_storage(anndata_layout, group, encoding)? else {
                 continue;
             };
             // Shape and chunks come from the array that holds the values.
-            let (shape, chunk_shape) = match &var_encoding {
-                VarEncoding::Categorical { codes: values, .. }
-                | VarEncoding::Nullable { values, .. } => match open_array(store, values) {
-                    Ok(arr) => (arr.shape().to_vec(), first_chunk_shape(&arr)?),
-                    Err(err) if is_unsupported_array_error(err.as_ref()) => {
-                        tree.unsupported.push(group.clone());
-                        continue;
+            let (shape, chunk_shape) = match &storage {
+                Storage::Sparse(matrix) => (matrix.shape.clone(), matrix.shape.clone()),
+                _ => {
+                    let values = storage
+                        .values_array(group)
+                        .expect("an AnnData group variable");
+                    match open_array(store, values) {
+                        Ok(arr) => (arr.shape().to_vec(), first_chunk_shape(&arr)?),
+                        Err(err) if is_unsupported_array_error(err.as_ref()) => {
+                            tree.unsupported.push(group.clone());
+                            continue;
+                        }
+                        Err(err) => return Err(err),
                     }
-                    Err(err) => return Err(err),
-                },
-                VarEncoding::Sparse(matrix) => (matrix.shape.clone(), matrix.shape.clone()),
+                }
             };
             let dims = anndata::axis_names(group, shape.len(), encoding_of);
-            tree.vars.insert(
+            tree.variables.insert(
                 group.clone(),
-                NodeVar {
+                Variable {
                     path: group.clone(),
                     node: logical(group),
                     dims,
                     shape,
                     chunk_shape,
                     attrs: Default::default(),
-                    encoding: Some(var_encoding),
-                    unreadable: None,
+                    storage,
                     in_dataframe: in_dataframe(group),
                 },
             );
@@ -283,7 +233,7 @@ impl StoreTree {
 
     /// Register every dimension coordinate in its node.
     fn register_dim_coords(&mut self) {
-        for var in self.vars.values().filter(|v| is_dim_coord(v)) {
+        for var in self.variables.values().filter(|v| is_dim_coord(v)) {
             self.coords.insert(
                 (var.node.clone(), basename(&var.path).to_string()),
                 (var.path.clone(), var.shape[0]),
@@ -297,22 +247,22 @@ impl StoreTree {
     fn register_anndata_indexes(&mut self, layout: &anndata::Layout) {
         for (frame, index) in &layout.indexes {
             let path = join(frame, index);
-            let Some(var) = self.vars.get(&path) else {
+            let Some(var) = self.variables.get(&path) else {
                 continue;
             };
             // A string array, or a nullable string array whose values are
             // never missing in an index.
-            let values = match &var.encoding {
-                None => path.clone(),
-                Some(VarEncoding::Nullable { values, .. }) => values.clone(),
-                Some(_) => continue,
+            let values = match &var.storage {
+                Storage::Array => path.clone(),
+                Storage::Nullable { values, .. } => values.clone(),
+                _ => continue,
             };
             let Some([dim]) = var.dims.as_deref() else {
                 continue;
             };
             let key = (var.node.clone(), dim.clone());
             let len = var.shape[0];
-            self.vars.remove(&path);
+            self.variables.remove(&path);
             self.coords.insert(key, (values, len));
         }
         let aliased: Vec<_> = self
@@ -340,38 +290,35 @@ impl StoreTree {
 
     /// Every node that directly holds at least one array, sorted.
     pub fn nodes(&self) -> Vec<String> {
-        let nodes: BTreeSet<&str> = self.vars.values().map(|v| v.node.as_str()).collect();
+        let nodes: BTreeSet<&str> = self.variables.values().map(|v| v.node.as_str()).collect();
         nodes.into_iter().map(str::to_string).collect()
     }
 
-    fn vars_in<'a>(&'a self, node: &'a str) -> impl Iterator<Item = &'a NodeVar> + 'a {
-        self.vars.values().filter(move |v| v.node == node)
+    fn variables_in<'a>(&'a self, node: &'a str) -> impl Iterator<Item = &'a Variable> + 'a {
+        self.variables.values().filter(move |v| v.node == node)
     }
 
-    /// The tables of one node: arrays grouped by `(dims, shape)`, sorted by
-    /// dims. Arrays in one table may be chunked differently; the table's
-    /// `chunk_shape` is the largest chunk length in each dimension, the grid
-    /// `read_zarr` plans work units on (decision 6). Two entries with the same
-    /// dims mean arrays that share dimension names but not a shape; `read_zarr`
-    /// cannot read those dims as one table. A node that is not aligned with its
-    /// ancestors is reported in [`NodeGroups::misaligned`] rather than as an
-    /// error, so that `read_zarr_groups` can still list the rest of the store.
-    pub fn dim_groups(&self, node: &str) -> NodeGroups {
+    /// The tables of one node: its variables grouped by `(dims, shape)`,
+    /// sorted by dims. Variables in one table may be chunked differently; the
+    /// table's `chunk_shape` is the largest chunk length in each dimension,
+    /// the grid `read_zarr` plans work units on (decision 6). Two tables with
+    /// the same dims hold variables that share dimension names but not a
+    /// shape; `read_zarr` cannot read those dims as one table. A node that is
+    /// not aligned with its ancestors is reported in
+    /// [`NodeTables::misaligned`] rather than as an error, so that
+    /// `read_zarr_groups` can still list the rest of the store.
+    pub fn tables(&self, node: &str) -> NodeTables {
         let mut misaligned = self.check_alignment(node).err();
         let facts: Vec<ArrayFacts> = self
-            .vars_in(node)
+            .variables_in(node)
             .map(|v| (v.path.as_str(), &v.attrs, v.shape.as_slice()))
             .collect();
         let (aux_coords, bounds) = cf_auxiliary_vars(&facts);
 
-        type GroupKey = (Vec<String>, Vec<u64>);
-        let mut groups: HashMap<GroupKey, DimGroup> = HashMap::new();
+        type TableKey = (Vec<String>, Vec<u64>);
+        let mut tables: HashMap<TableKey, Table> = HashMap::new();
         let mut unnamed = Vec::new();
-        // Sparse matrices go last, so that each can join a dense table with the
-        // same dims and shape (see below).
-        let mut vars: Vec<&NodeVar> = self.vars_in(node).collect();
-        vars.sort_by_key(|var| is_sparse(var));
-        for var in vars {
+        for var in self.variables_in(node) {
             if var.shape.is_empty() || bounds.contains(&var.path) || aux_coords.contains(&var.path)
             {
                 continue;
@@ -389,8 +336,8 @@ impl StoreTree {
             // densely there; sparse matrices on their own make a table of
             // stored entries. Chunk shapes may differ (decision 6).
             let key = (dims.clone(), var.shape.clone());
-            if let Some(group) = groups.get_mut(&key) {
-                add_to_group(group, var);
+            if let Some(table) = tables.get_mut(&key) {
+                table.variables.push(var.clone());
                 continue;
             }
             let mut coords = Vec::new();
@@ -403,64 +350,36 @@ impl StoreTree {
                     }
                 }
             }
-            let mut group = DimGroup {
-                dims: dims.clone(),
-                shape: var.shape.clone(),
-                chunk_shape: Vec::new(),
-                data_var_names: Vec::new(),
-                coords,
-                encodings: HashMap::new(),
-                unreadable: Vec::new(),
-            };
-            add_to_group(&mut group, var);
-            groups.insert(key, group);
-        }
-        // A table of unreadable arrays only has no chunk grid to plan on.
-        for group in groups.values_mut() {
-            if group.chunk_shape.is_empty() {
-                group.chunk_shape = group.shape.clone();
-            }
+            tables.insert(
+                key,
+                Table {
+                    dims: dims.clone(),
+                    shape: var.shape.clone(),
+                    chunk_shape: Vec::new(),
+                    coords,
+                    variables: vec![var.clone()],
+                },
+            );
         }
 
-        // The plan grid is the largest chunk length per dim over the dense
-        // arrays. A sparse matrix has no chunk grid of its own on this shape:
-        // next to dense arrays it is densified per plan chunk, and on its own
-        // it is read in blocks of entries.
-        for group in groups.values_mut() {
-            let dense_chunks = group
-                .data_var_names
-                .iter()
-                .filter(|path| !matches!(group.encodings.get(*path), Some(VarEncoding::Sparse(_))))
-                .map(|path| &self.vars[path].chunk_shape);
-            let mut plan: Option<Vec<u64>> = None;
-            for chunks in dense_chunks {
-                plan = Some(match plan {
-                    None => chunks.clone(),
-                    Some(p) => p.iter().zip(chunks).map(|(&a, &b)| a.max(b)).collect(),
-                });
-            }
-            if let Some(plan) = plan {
-                group.chunk_shape = plan;
+        let mut tables: Vec<Table> = tables.into_values().collect();
+        for table in &mut tables {
+            table.chunk_shape = plan_grid(table);
+            // An AnnData data frame lists its columns in `column-order`.
+            if let Some(layout) = &self.layout {
+                table
+                    .variables
+                    .sort_by_cached_key(|v| layout.column_rank(&v.path));
             }
         }
-
-        let mut groups: Vec<DimGroup> = groups.into_values().collect();
-        // An AnnData data frame lists its columns in `column-order`.
-        if let Some(layout) = &self.layout {
-            for group in &mut groups {
-                group
-                    .data_var_names
-                    .sort_by_cached_key(|path| layout.column_rank(path));
-            }
-        }
-        groups.sort_by(|a, b| {
+        tables.sort_by(|a, b| {
             a.dims
                 .cmp(&b.dims)
                 .then_with(|| a.shape.cmp(&b.shape))
-                .then_with(|| a.data_var_names.cmp(&b.data_var_names))
+                .then_with(|| a.variable_paths().cmp(&b.variable_paths()))
         });
-        NodeGroups {
-            groups,
+        NodeTables {
+            tables,
             unnamed,
             misaligned,
         }
@@ -494,13 +413,13 @@ impl StoreTree {
         }
         let parent = node_of(node);
         let mut parent_sizes: HashMap<&str, (u64, &str)> = HashMap::new();
-        for var in self.vars_in(parent) {
+        for var in self.variables_in(parent) {
             let Some(dims) = &var.dims else { continue };
             for (dim, &len) in dims.iter().zip(&var.shape) {
                 parent_sizes.entry(dim).or_insert((len, &var.path));
             }
         }
-        for var in self.vars_in(node) {
+        for var in self.variables_in(node) {
             let Some(dims) = &var.dims else { continue };
             for (dim, &len) in dims.iter().zip(&var.shape) {
                 if let Some(&(parent_len, parent_var)) = parent_sizes.get(dim.as_str()) {
@@ -523,8 +442,8 @@ impl StoreTree {
 /// The tables of one node, plus the arrays left out because they declare no
 /// dimension names.
 #[derive(Debug)]
-pub struct NodeGroups {
-    pub groups: Vec<DimGroup>,
+pub struct NodeTables {
+    pub tables: Vec<Table>,
     pub unnamed: Vec<String>,
     /// Why the node is not aligned with its ancestors, if it is not. `read_zarr`
     /// fails with this message; `read_zarr_groups` gives the node's rows no table
@@ -532,35 +451,26 @@ pub struct NodeGroups {
     pub misaligned: Option<String>,
 }
 
-/// Add `var` to its table: as a data variable whose chunks widen the plan
-/// grid (decision 6), or, if zarrs cannot open it, to the table's unreadable
-/// arrays.
-fn add_to_group(group: &mut DimGroup, var: &NodeVar) {
-    if let Some(err) = &var.unreadable {
-        group.unreadable.push((var.path.clone(), err.clone()));
-        return;
-    }
-    group.data_var_names.push(var.path.clone());
-    if let Some(encoding) = &var.encoding {
-        group.encodings.insert(var.path.clone(), encoding.clone());
-    }
-    if group.chunk_shape.is_empty() {
-        group.chunk_shape = var.chunk_shape.clone();
-    } else {
-        for (plan, &c) in group.chunk_shape.iter_mut().zip(&var.chunk_shape) {
-            *plan = (*plan).max(c);
-        }
-    }
-}
-
-fn is_sparse(var: &NodeVar) -> bool {
-    matches!(var.encoding, Some(VarEncoding::Sparse(_)))
+/// The grid work units follow (decision 6): the largest chunk length in each
+/// dimension over the variables read chunk by chunk. A sparse matrix has no
+/// chunk grid on the table's shape: beside dense arrays it is densified per
+/// plan chunk, and on its own it is read in blocks of entries. Without such
+/// variables (a table of sparse matrices, or of unreadable arrays) the grid
+/// is the shape.
+fn plan_grid(table: &Table) -> Vec<u64> {
+    table
+        .variables
+        .iter()
+        .filter(|v| !matches!(v.storage, Storage::Sparse(_) | Storage::Unreadable { .. }))
+        .map(|v| v.chunk_shape.clone())
+        .reduce(|a, b| a.iter().zip(&b).map(|(&x, &y)| x.max(y)).collect())
+        .unwrap_or_else(|| table.shape.clone())
 }
 
 /// A dimension coordinate: a 1-D array whose only dimension has its name.
-/// An AnnData data frame's columns never are (see [`NodeVar::in_dataframe`]).
-fn is_dim_coord(var: &NodeVar) -> bool {
-    var.encoding.is_none()
+/// An AnnData data frame's columns never are (see [`Variable::in_dataframe`]).
+fn is_dim_coord(var: &Variable) -> bool {
+    matches!(var.storage, Storage::Array)
         && !var.in_dataframe
         && var.shape.len() == 1
         && var
@@ -588,20 +498,20 @@ pub fn ensure_group_exists(
     .into())
 }
 
-/// Table names for one node's dim groups, in order. A name is `None` where the
+/// Table names for one node's tables, in order. A name is `None` where the
 /// node has arrays of different shapes for the same dims, which `read_zarr`
 /// cannot read as one table. It is also `None` for every group whose name equals
 /// another's after case folding, because DuckDB identifiers ignore case.
 /// xarray-sql raises on such a collision (`xarray_sql.df.resolve_table_names`);
 /// here the rest of the node keeps its names, and `dims :=` still reads it.
-pub fn table_names(groups: &[DimGroup]) -> Vec<Option<String>> {
+pub fn table_names(tables: &[Table]) -> Vec<Option<String>> {
     let mut shapes: HashMap<&[String], usize> = HashMap::new();
-    for group in groups {
-        *shapes.entry(group.dims.as_slice()).or_default() += 1;
+    for table in tables {
+        *shapes.entry(table.dims.as_slice()).or_default() += 1;
     }
-    let names: Vec<Option<String>> = groups
+    let names: Vec<Option<String>> = tables
         .iter()
-        .map(|group| (shapes[group.dims.as_slice()] == 1).then(|| default_table_name(&group.dims)))
+        .map(|table| (shapes[table.dims.as_slice()] == 1).then(|| default_table_name(&table.dims)))
         .collect();
     let mut folded: HashMap<String, usize> = HashMap::new();
     for name in names.iter().flatten() {
@@ -641,20 +551,18 @@ mod tests {
         );
         assert_eq!(default_table_name(&[]), "scalar");
 
-        let group = |dims: &[&str], len: u64| DimGroup {
+        let table = |dims: &[&str], len: u64| Table {
             dims: s(dims),
             shape: vec![len; dims.len()],
             chunk_shape: vec![len; dims.len()],
-            data_var_names: vec![],
             coords: vec![],
-            encodings: Default::default(),
-            unreadable: vec![],
+            variables: vec![],
         };
-        let names = table_names(&[group(&["x"], 2), group(&["y"], 3), group(&["y"], 4)]);
+        let names = table_names(&[table(&["x"], 2), table(&["y"], 3), table(&["y"], 4)]);
         assert_eq!(names, vec![Some("x".to_string()), None, None]);
 
         // A case collision leaves only the colliding groups unnamed.
-        let names = table_names(&[group(&["X"], 2), group(&["x"], 3), group(&["y"], 4)]);
+        let names = table_names(&[table(&["X"], 2), table(&["x"], 3), table(&["y"], 4)]);
         assert_eq!(names, vec![None, None, Some("y".to_string())]);
     }
 }
