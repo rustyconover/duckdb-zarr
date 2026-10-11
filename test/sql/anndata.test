@@ -44,21 +44,21 @@ require zarr
 # shows names in those columns, including the tables of child groups.
 query TTTT
 SELECT group_path, table_name, dims, data_vars
-FROM read_zarr_groups('test/fixtures/anndata/pbmc_like.zarr')
+FROM read_zarr_tables('test/fixtures/anndata/pbmc_like.zarr')
 ORDER BY group_path, table_name;
 ----
-/	obs	["obs"]	["obs/cell_type","obs/n_genes","obs/batch","obs/donor"]
-/	obs_var	["obs","var"]	["X"]
-/	var	["var"]	["var/mean_expr","var/gene_symbol"]
-/layers	obs_var	["obs","var"]	["layers/spliced","layers/unspliced"]
-/obsm	obs_X_umap_component	["obs","X_umap_component"]	["obsm/X_umap"]
-/obsp	obs_i_obs_j	["obs_i","obs_j"]	["obsp/connectivities"]
-/varp	var_i_var_j	["var_i","var_j"]	["varp/corr","varp/corr_csc"]
+/	obs	[obs]	[obs/cell_type, obs/n_genes, obs/batch, obs/donor]
+/	obs_var	[obs, var]	[X]
+/	var	[var]	[var/mean_expr, var/gene_symbol]
+/layers	obs_var	[obs, var]	[layers/spliced, layers/unspliced]
+/obsm	obs_X_umap_component	[obs, X_umap_component]	[obsm/X_umap]
+/obsp	obs_i_obs_j	[obs_i, obs_j]	[obsp/connectivities]
+/varp	var_i_var_j	[var_i, var_j]	[varp/corr, varp/corr_csc]
 
 # Columns come in the data frame's `column-order`, as in adata.obs.
 query T
 SELECT string_agg(column_name, ' ')
-FROM (DESCRIBE SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs']));
+FROM (DESCRIBE SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs'));
 ----
 obs cell_type n_genes batch donor
 
@@ -76,7 +76,7 @@ in an AnnData store, the columns of '/obs' are in the group '/'
 
 # The other table functions follow the same rule.
 statement error
-SELECT * FROM read_zarr_groups('test/fixtures/anndata/pbmc_like.zarr', group_path := 'obs');
+SELECT * FROM read_zarr_tables('test/fixtures/anndata/pbmc_like.zarr', group_path := 'obs');
 ----
 in an AnnData store, the columns of '/obs' are in the group '/'
 
@@ -103,7 +103,7 @@ SELECT COUNT(*) FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr', 
 # ignore case), so they keep their store paths; those collide too, so the later
 # one gets a number.
 query TII
-SELECT obs, "obs/obs", "obs/Obs_1" FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', dims := ['obs']) ORDER BY obs;
+SELECT obs, "obs/obs", "obs/Obs_1" FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', table_name := 'obs') ORDER BY obs;
 ----
 c0	0	1
 c1	10	2
@@ -120,7 +120,7 @@ c2	7
 # layers a (CSR) and b (CSC) alone cannot be read as one table of stored
 # entries: no table name, and an error that points at array_path=.
 query T
-SELECT table_name FROM read_zarr_groups('test/fixtures/anndata/axis_named_columns.zarr', group_path := 'layers');
+SELECT table_name FROM read_zarr_tables('test/fixtures/anndata/axis_named_columns.zarr', group_path := 'layers');
 ----
 NULL
 
@@ -160,7 +160,7 @@ SELECT * FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr', group_p
 '/obs/cell_type' is part of the variable 'obs/cell_type', not a group of tables
 
 statement error
-SELECT * FROM read_zarr_groups('test/fixtures/anndata/pbmc_like.zarr', group_path := 'X');
+SELECT * FROM read_zarr_tables('test/fixtures/anndata/pbmc_like.zarr', group_path := 'X');
 ----
 '/X' is part of the variable 'X', not a group of tables
 
@@ -179,7 +179,7 @@ X/data X/indices X/indptr
 # ── obs and var: one row per cell or gene, encodings decoded ──────────────────
 query TTTI
 SELECT obs, cell_type, donor, batch
-FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs'])
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs')
 WHERE obs IN ('cell_0', 'cell_1', 'cell_4', 'cell_19')
 ORDER BY obs;
 ----
@@ -191,12 +191,12 @@ cell_4	NULL	donor_04	2020
 # A categorical with string categories is an ENUM; with integer categories it
 # keeps their type, since an ENUM holds strings only.
 query TTT
-SELECT typeof(obs), typeof(cell_type), typeof(batch) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs']) LIMIT 1;
+SELECT typeof(obs), typeof(cell_type), typeof(batch) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs') LIMIT 1;
 ----
 VARCHAR	ENUM('B cell', 'NK cell', 'T cell')	BIGINT
 
 query TI
-SELECT cell_type, COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs']) GROUP BY ALL ORDER BY ALL;
+SELECT cell_type, COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs') GROUP BY ALL ORDER BY ALL;
 ----
 B cell	6
 NK cell	6
@@ -205,7 +205,7 @@ NULL	1
 
 query TT
 SELECT var, gene_symbol
-FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['var'])
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'var')
 WHERE var IN ('gene_5', 'gene_6', 'gene_7')
 ORDER BY var;
 ----
@@ -214,6 +214,7 @@ gene_6	NULL
 gene_7	Foxp3
 
 # ── X: a sparse matrix reads as one row per stored entry ──────────────────────
+# dims := ['obs', 'var'] selects the same table as table_name := 'obs_var'.
 query IR
 SELECT COUNT(*), SUM(X) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs', 'var']);
 ----
@@ -223,7 +224,7 @@ SELECT COUNT(*), SUM(X) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', d
 query I
 SELECT COUNT(*) FROM (
   SELECT CAST(substr(obs, 6) AS INT) AS i, CAST(substr(var, 6) AS INT) AS j, X
-  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs', 'var']))
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs_var'))
 WHERE NOT ((i + j) % 5 = 0 AND X = i * 10 + j + 1 AND i NOT IN (7, 8, 19));
 ----
 0
@@ -294,17 +295,17 @@ SELECT name, array_path_dims FROM read_zarr_metadata('test/fixtures/anndata/pbmc
 WHERE name IN ('obs/n_genes', 'obsm/X_umap', 'varp/corr', 'X/data', 'obs/cell_type/codes')
 ORDER BY name;
 ----
-X/data	["dim_0"]
-obs/cell_type/codes	["dim_0"]
-obs/n_genes	["obs"]
-obsm/X_umap	["obs","X_umap_component"]
-varp/corr	["var_i","var_j"]
+X/data	[dim_0]
+obs/cell_type/codes	[dim_0]
+obs/n_genes	[obs]
+obsm/X_umap	[obs, X_umap_component]
+varp/corr	[var_i, var_j]
 
 # `dims` still shows only declared names: none, for AnnData.
 query III
 SELECT dtype, dims, array_path_dims FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr') WHERE name = 'X/data';
 ----
-float32 / <f4	[]	["dim_0"]
+float32 / <f4	[]	[dim_0]
 
 # One array read alone has no index to take names from, so its dimension
 # columns are positions.
@@ -325,11 +326,11 @@ string / |O
 # hold 6 + 156, B cells (6) 106, NK cells (6) 56, and the cell with no type none.
 query TR
 SELECT o.cell_type, AVG(COALESCE(x.X, 0)) AS mean_cd4
-FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs']) o
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs') o
 LEFT JOIN (
   SELECT x.obs, x.X
-  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs', 'var']) x
-  JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['var']) v USING (var)
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs_var') x
+  JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'var') v USING (var)
   WHERE v.gene_symbol = 'Cd4'
 ) x USING (obs)
 GROUP BY o.cell_type
@@ -345,19 +346,19 @@ statement ok
 ATTACH ':memory:' AS pbmc;
 
 statement ok
-CREATE VIEW pbmc.main.obs AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', dims := ['obs']);
+CREATE VIEW pbmc.main.obs AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', table_name := 'obs');
 
 statement ok
-CREATE VIEW pbmc.main.var AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', dims := ['var']);
+CREATE VIEW pbmc.main.var AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', table_name := 'var');
 
 statement ok
-CREATE VIEW pbmc.main.obs_var AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', dims := ['obs', 'var']);
+CREATE VIEW pbmc.main.obs_var AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', table_name := 'obs_var');
 
 statement ok
 CREATE SCHEMA pbmc.layers;
 
 statement ok
-CREATE VIEW pbmc.layers.obs_var AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'layers', dims := ['obs', 'var']);
+CREATE VIEW pbmc.layers.obs_var AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'layers', table_name := 'obs_var');
 
 # A table in main needs no schema name.
 query TTR
@@ -610,7 +611,7 @@ NK cell	NULL	24.500000
 # The native sparse scan agrees with the hand-written expansion, entry by entry.
 query II
 SELECT COUNT(*), COUNT(*) FILTER (WHERE t.X IS DISTINCT FROM l.value)
-FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs', 'var']) t
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs_var') t
 FULL JOIN x_long l ON t.obs = 'cell_' || l.cell AND t.var = 'gene_' || l.gene;
 ----
 27	0

@@ -26,16 +26,23 @@
 require zarr
 
 # ── The two tables ────────────────────────────────────────────────────────────
-# read_zarr_groups gives one table per dimension set, named like xarray-sql's
+# read_zarr_tables gives one table per dimension set, named like xarray-sql's
 # default ("_".join(dims)). The surface table plans its work units on the
 # largest chunk per dimension (decision 6): total_precipitation's six hours.
 query TTTTT
 SELECT schema_name, table_name, dims, chunk_shape, data_vars
-FROM read_zarr_groups('test/fixtures/xarray_tutorial/era5_like.zarr')
+FROM read_zarr_tables('test/fixtures/xarray_tutorial/era5_like.zarr')
 ORDER BY table_name;
 ----
-main	time_latitude_longitude	["time","latitude","longitude"]	[6,7,7]	["10m_u_component_of_wind","2m_temperature","total_precipitation"]
-main	time_level_latitude_longitude	["time","level","latitude","longitude"]	[1,4,7,7]	["geopotential","temperature"]
+main	time_latitude_longitude	[time, latitude, longitude]	[6, 7, 7]	[10m_u_component_of_wind, 2m_temperature, total_precipitation]
+main	time_level_latitude_longitude	[time, level, latitude, longitude]	[1, 4, 7, 7]	[geopotential, temperature]
+
+# The catalog's columns are lists: which table holds temperature?
+query T
+SELECT table_name FROM read_zarr_tables('test/fixtures/xarray_tutorial/era5_like.zarr')
+WHERE list_contains(data_vars, 'temperature');
+----
+time_level_latitude_longitude
 
 # A read of the whole store must say which table it means.
 statement error
@@ -45,17 +52,17 @@ group '/' has 2 tables
 
 # ── Register them as era5.surface and era5.atmosphere ─────────────────────────
 # xarray-sql's table_names maps each dimension tuple to a name. Here each view
-# names the table its dims select.
+# gives the catalog's name for a table the name the demo uses.
 statement ok
 ATTACH ':memory:' AS era5;
 
 statement ok
 CREATE VIEW era5.surface AS
-  SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', dims := ['time', 'latitude', 'longitude']);
+  SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_latitude_longitude');
 
 statement ok
 CREATE VIEW era5.atmosphere AS
-  SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', dims := ['time', 'level', 'latitude', 'longitude']);
+  SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_level_latitude_longitude');
 
 query T
 SELECT string_agg(column_name || ' ' || column_type, ', ') FROM (DESCRIBE era5.surface);

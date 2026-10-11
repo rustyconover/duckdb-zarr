@@ -48,14 +48,14 @@ FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', array_path :=
 27	0	702.000000
 
 # ── different chunk shapes in one table ──────────────────────────────────────
-# read_zarr_groups shows the grid work units follow: the largest chunk length
+# read_zarr_tables shows the grid work units follow: the largest chunk length
 # in each dimension.
 query II
-SELECT dims, chunk_shape FROM read_zarr_groups('test/fixtures/xarray_tutorial/ragged_chunks.zarr')
-WHERE dims IN ('["i"]', '["a","b"]') ORDER BY dims;
+SELECT dims, chunk_shape FROM read_zarr_tables('test/fixtures/xarray_tutorial/ragged_chunks.zarr')
+WHERE dims IN (['i'], ['a', 'b']) ORDER BY dims;
 ----
-["a","b"]	[3,2]
-["i"]	[4]
+[a, b]	[3, 2]
+[i]	[4]
 
 # t (chunks 4) and u (chunks 3): boundaries that don't nest; t is a string.
 query II

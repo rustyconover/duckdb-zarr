@@ -25,7 +25,7 @@ true
 query II
 SELECT dims, array_path_dims FROM read_zarr_metadata('test/fixtures/xarray_tutorial/unsupported_dtype.zarr') WHERE name = 'good';
 ----
-[]	["dim_0"]
+[]	[dim_0]
 
 # array_path= names an unnamed dimension dim_0 and reads it as an integer index.
 query III
@@ -60,10 +60,10 @@ SELECT COUNT(*), MAX(y) FROM read_zarr('test/fixtures/xarray_tutorial/unreadable
 ----
 3	2
 
-# read_zarr_groups lists both tables; the x table has no name because it cannot
+# read_zarr_tables lists both tables; the x table has no name because it cannot
 # be read as one table.
 query TT
-SELECT dims, table_name FROM read_zarr_groups('test/fixtures/xarray_tutorial/unreadable_in_table.zarr') ORDER BY dims;
+SELECT dims, table_name FROM read_zarr_tables('test/fixtures/xarray_tutorial/unreadable_in_table.zarr') ORDER BY dims;
 ----
-["x"]	NULL
-["y"]	y
+[x]	NULL
+[y]	y

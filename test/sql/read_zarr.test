@@ -55,17 +55,17 @@ lon	coord
 temperature	data
 time	coord
 
-# ── read_zarr_groups ──────────────────────────────────────────────────────────
+# ── read_zarr_tables ──────────────────────────────────────────────────────────
 
 query I
-SELECT COUNT(*) FROM read_zarr_groups('test/fixtures/xarray_tutorial/float_baseline.zarr');
+SELECT COUNT(*) FROM read_zarr_tables('test/fixtures/xarray_tutorial/float_baseline.zarr');
 ----
 1
 
 query T
-SELECT dims FROM read_zarr_groups('test/fixtures/xarray_tutorial/float_baseline.zarr');
+SELECT dims FROM read_zarr_tables('test/fixtures/xarray_tutorial/float_baseline.zarr');
 ----
-["time","lat","lon"]
+[time, lat, lon]
 
 # ── air_temperature ───────────────────────────────────────────────────────────
 # int16 on-disk with scale_factor=0.01 → packed-int decoding → Double column.
@@ -207,9 +207,9 @@ SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/multi_dim_group.zarr') LI
 ----
 has 2 tables
 
-# read_zarr_groups shows two groups.
+# read_zarr_tables shows two groups.
 query I
-SELECT COUNT(*) FROM read_zarr_groups('test/fixtures/xarray_tutorial/multi_dim_group.zarr');
+SELECT COUNT(*) FROM read_zarr_tables('test/fixtures/xarray_tutorial/multi_dim_group.zarr');
 ----
 2
 

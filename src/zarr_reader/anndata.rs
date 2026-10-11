@@ -158,7 +158,7 @@ pub fn check_group_path(
     let axis = if node == "raw/var" { RAW_VAR } else { node };
     Err(format!(
         "'{store_path}': in an AnnData store, the columns of '{}' are in the group '{}': \
-         read_zarr('{store_path}', group_path := '{parent}', dims := ['{axis}'])",
+         read_zarr('{store_path}', group_path := '{parent}', table_name := '{axis}')",
         display_group(node),
         display_group(&parent)
     )

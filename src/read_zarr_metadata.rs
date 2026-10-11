@@ -3,11 +3,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use duckdb::core::LogicalTypeId;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
+use crate::list_columns::{ubigint_list, varchar_list, write_string_lists, write_u64_lists};
 use crate::selection::Selection;
 use crate::zarr_reader::meta::{
     array_path_dims, cf_auxiliary_vars, dimension_names as get_dim_names, extract_file_system,
-    is_unsupported_array_error, list_array_names, open_array, open_store, select_array_name,
-    ArrayFacts,
+    first_chunk_shape, is_unsupported_array_error, list_array_names, open_array, open_store,
+    select_array_name, ArrayFacts,
 };
 use crate::zarr_reader::{anndata, tree};
 
@@ -15,15 +16,15 @@ use crate::zarr_reader::{anndata, tree};
 #[derive(Debug, Clone)]
 struct MetaRow {
     name: String,
-    dims: String, // JSON array string e.g. '["lat","lon"]'
+    dims: Vec<String>,
     dtype: String,
-    shape: String, // JSON array string e.g. '[4,6]'
-    chunk_shape: String,
+    shape: Vec<u64>,
+    chunk_shape: Vec<u64>,
     attrs: String, // full attrs as JSON string; for "unsupported", {"error": ...}
     role: String,  // "coord" | "data" | "aux_coord" | "bounds" | "scalar" | "unsupported"
     // Dimension names that read_zarr(store, array_path := name) binds. Differs from
     // `dims` only when the array declares no names (then dim_0, dim_1, ...).
-    array_path_dims: String,
+    array_path_dims: Vec<String>,
 }
 
 pub struct ReadZarrMetaBind {
@@ -48,13 +49,13 @@ impl VTab for ReadZarrMetaVTab {
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         bind.add_result_column("name", LogicalTypeId::Varchar.into());
-        bind.add_result_column("dims", LogicalTypeId::Varchar.into());
+        bind.add_result_column("dims", varchar_list());
         bind.add_result_column("dtype", LogicalTypeId::Varchar.into());
-        bind.add_result_column("shape", LogicalTypeId::Varchar.into());
-        bind.add_result_column("chunk_shape", LogicalTypeId::Varchar.into());
+        bind.add_result_column("shape", ubigint_list());
+        bind.add_result_column("chunk_shape", ubigint_list());
         bind.add_result_column("attrs", LogicalTypeId::Varchar.into());
         bind.add_result_column("role", LogicalTypeId::Varchar.into());
-        bind.add_result_column("array_path_dims", LogicalTypeId::Varchar.into());
+        bind.add_result_column("array_path_dims", varchar_list());
 
         let store_path = bind.get_parameter(0).to_string();
         let fs = unsafe { extract_file_system(bind) };
@@ -122,28 +123,19 @@ impl VTab for ReadZarrMetaVTab {
                 Err(err) => {
                     rows.push(MetaRow {
                         name: name.to_string(),
-                        dims: "[]".to_string(),
+                        dims: Vec::new(),
                         dtype: "unsupported".to_string(),
-                        shape: "[]".to_string(),
-                        chunk_shape: "[]".to_string(),
+                        shape: Vec::new(),
+                        chunk_shape: Vec::new(),
                         attrs: serde_json::json!({ "error": err }).to_string(),
                         role: "unsupported".to_string(),
-                        array_path_dims: "[]".to_string(),
+                        array_path_dims: Vec::new(),
                     });
                     continue;
                 }
             };
             let shape = arr.shape().to_vec();
-            // chunk_grid_shape() returns number-of-chunks per dim, NOT element shape.
-            // Use chunk_shape([0,0,...]) to get the actual per-chunk element dimensions.
-            let chunk_shape: Vec<u64> = if !shape.is_empty() {
-                let first = vec![0u64; shape.len()];
-                arr.chunk_shape(&first)
-                    .map(|cs| cs.iter().map(|x| x.get()).collect())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            let chunk_shape = first_chunk_shape(arr).unwrap_or_default();
 
             let dims = get_dim_names(arr, name).unwrap_or_default();
             let bound_dims = array_path_dims(&store, layout.as_ref(), arr, name);
@@ -167,13 +159,13 @@ impl VTab for ReadZarrMetaVTab {
 
             rows.push(MetaRow {
                 name: name.clone(),
-                dims: serde_json::to_string(&dims).unwrap_or_default(),
+                dims,
                 dtype: dtype_str,
-                shape: serde_json::to_string(&shape).unwrap_or_default(),
-                chunk_shape: serde_json::to_string(&chunk_shape).unwrap_or_default(),
+                shape,
+                chunk_shape,
                 attrs: serde_json::to_string(&attrs).unwrap_or_default(),
                 role: role.to_string(),
-                array_path_dims: serde_json::to_string(&bound_dims).unwrap_or_default(),
+                array_path_dims: bound_dims,
             });
         }
 
@@ -204,26 +196,24 @@ impl VTab for ReadZarrMetaVTab {
         let end = (start + vector_size).min(bind.rows.len());
         let n = end - start;
 
+        let rows = &bind.rows[start..end];
         let v_name = output.flat_vector(0);
-        let v_dims = output.flat_vector(1);
         let v_dtype = output.flat_vector(2);
-        let v_shape = output.flat_vector(3);
-        let v_cshape = output.flat_vector(4);
         let v_attrs = output.flat_vector(5);
         let v_role = output.flat_vector(6);
-        let v_bound = output.flat_vector(7);
-
-        for (i, row) in bind.rows[start..end].iter().enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             use duckdb::core::Inserter;
             v_name.insert(i, row.name.as_str());
-            v_dims.insert(i, row.dims.as_str());
             v_dtype.insert(i, row.dtype.as_str());
-            v_shape.insert(i, row.shape.as_str());
-            v_cshape.insert(i, row.chunk_shape.as_str());
             v_attrs.insert(i, row.attrs.as_str());
             v_role.insert(i, row.role.as_str());
-            v_bound.insert(i, row.array_path_dims.as_str());
         }
+        let strings = |f: fn(&MetaRow) -> &[String]| rows.iter().map(f).collect::<Vec<_>>();
+        let numbers = |f: fn(&MetaRow) -> &[u64]| rows.iter().map(f).collect::<Vec<_>>();
+        write_string_lists(output, 1, &strings(|r| &r.dims));
+        write_u64_lists(output, 3, &numbers(|r| &r.shape));
+        write_u64_lists(output, 4, &numbers(|r| &r.chunk_shape));
+        write_string_lists(output, 7, &strings(|r| &r.array_path_dims));
 
         output.set_len(n);
         Ok(())

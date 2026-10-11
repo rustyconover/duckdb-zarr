@@ -100,25 +100,67 @@ SELECT SUM(value) FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', 
 ----
 15
 
-# ── read_zarr_groups is the catalog ───────────────────────────────────────────
+# ── read_zarr_tables is the catalog ───────────────────────────────────────────
 
 # One row per table in every group, with the schema and table name it maps to.
 # The misaligned group's table has no name because read_zarr cannot read it.
 query TTTTTT
 SELECT group_path, schema_name, table_name, dims, data_vars, coord_vars
-FROM read_zarr_groups('test/fixtures/xarray_tutorial/datatree.zarr')
+FROM read_zarr_tables('test/fixtures/xarray_tutorial/datatree.zarr')
 ORDER BY group_path;
 ----
-/	main	x	["x"]	["bar"]	["x"]
-/misaligned	misaligned	NULL	["x"]	["misaligned/baz"]	[]
-/simulation/coarse	simulation/coarse	x_y	["x","y"]	["simulation/coarse/foo"]	["x","simulation/coarse/y"]
-/simulation/fine	simulation/fine	x_y	["x","y"]	["simulation/fine/foo"]	["x","simulation/fine/y"]
+/	main	x	[x]	[bar]	[x]
+/misaligned	misaligned	NULL	[x]	[misaligned/baz]	[]
+/simulation/coarse	simulation/coarse	x_y	[x, y]	[simulation/coarse/foo]	[x, simulation/coarse/y]
+/simulation/fine	simulation/fine	x_y	[x, y]	[simulation/fine/foo]	[x, simulation/fine/y]
 
 query TT
 SELECT table_name, shape
-FROM read_zarr_groups('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine');
+FROM read_zarr_tables('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine');
 ----
-x_y	[3,4]
+x_y	[3, 4]
+
+# The catalog columns are lists, so they can be searched: which table holds foo?
+query TT
+SELECT group_path, table_name FROM read_zarr_tables('test/fixtures/xarray_tutorial/datatree.zarr')
+WHERE list_contains(list_transform(data_vars, v -> split_part(v, '/', -1)), 'foo')
+ORDER BY group_path;
+----
+/simulation/coarse	x_y
+/simulation/fine	x_y
+
+# read_zarr_groups is the 0.1.x name of read_zarr_tables.
+query I
+SELECT COUNT(*) FROM read_zarr_groups('test/fixtures/xarray_tutorial/datatree.zarr');
+----
+4
+
+# ── table_name= reads a table by its catalog name ──────────────────────────────────
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine', table_name := 'x_y');
+----
+12
+
+# DuckDB identifiers ignore case, and so does table_name=. "table" is its alias.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', table_name := 'X');
+----
+3
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', "table" := 'x');
+----
+3
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', table_name := 'x_y');
+----
+group '/' has no table named 'x_y'; its tables are ["x"]
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', table_name := 'x', dims := ['x']);
+----
+use either table_name= or dims=, not both
 
 # ── read_zarr_metadata group= lists the arrays of one group ────────────────────
 
@@ -132,7 +174,7 @@ simulation/fine/y	coord
 
 # ── Mounting the catalog by hand ──────────────────────────────────────────────
 # The recipe in docs/design.md, decision 8: one schema per group, one view per
-# read_zarr_groups row that has a table name.
+# read_zarr_tables row that has a table name.
 
 statement ok
 ATTACH ':memory:' AS sim;
@@ -142,11 +184,11 @@ CREATE SCHEMA sim."simulation/fine";
 
 statement ok
 CREATE VIEW sim."simulation/fine".x_y AS
-SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine', dims := ['x', 'y']);
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine', table_name := 'x_y');
 
 statement ok
 CREATE VIEW sim.main.x AS
-SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := '', dims := ['x']);
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := '', table_name := 'x');
 
 query IRR
 SELECT f.x, r.bar, SUM(f.foo)
@@ -161,7 +203,7 @@ ORDER BY f.x;
 
 # ── a group_path that does not exist is an error in every function ───────────
 statement error
-SELECT * FROM read_zarr_groups('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulaton');
+SELECT * FROM read_zarr_tables('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulaton');
 ----
 group '/simulaton' not found
 
@@ -174,6 +216,6 @@ group '/simulaton' not found
 # many_tables.zarr has 2100 one-array tables; DuckDB vectors hold 2048 rows.
 query III
 SELECT COUNT(*), COUNT(DISTINCT table_name), MAX(table_name = 'd2099')::INT
-FROM read_zarr_groups('test/fixtures/xarray_tutorial/many_tables.zarr');
+FROM read_zarr_tables('test/fixtures/xarray_tutorial/many_tables.zarr');
 ----
 2100	2100	1

@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use duckdb::core::LogicalTypeId;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
+use crate::list_columns::{ubigint_list, varchar_list, write_string_lists, write_u64_lists};
 use crate::selection::Selection;
 use crate::zarr_reader::anndata;
 use crate::zarr_reader::meta::{
@@ -19,44 +20,44 @@ struct TableRow {
     /// this row as one table, or its name collides with another table's after
     /// case folding (see [`tree::table_names`] and `check_alignment`).
     table_name: Option<String>,
-    dims: String,
-    shape: String,
-    chunk_shape: String,
-    data_vars: String,
-    coord_vars: String,
+    dims: Vec<String>,
+    shape: Vec<u64>,
+    chunk_shape: Vec<u64>,
+    data_vars: Vec<String>,
+    coord_vars: Vec<String>,
 }
 
-pub struct ReadZarrGroupsBind {
+pub struct ReadZarrTablesBind {
     rows: Vec<TableRow>,
 }
 
-unsafe impl Send for ReadZarrGroupsBind {}
-unsafe impl Sync for ReadZarrGroupsBind {}
+unsafe impl Send for ReadZarrTablesBind {}
+unsafe impl Sync for ReadZarrTablesBind {}
 
-pub struct ReadZarrGroupsInit {
+pub struct ReadZarrTablesInit {
     /// The first row the next call emits. A DataTree store can have more
     /// tables than one output chunk holds, so rows go out in pages.
     next: AtomicUsize,
 }
 
-unsafe impl Send for ReadZarrGroupsInit {}
-unsafe impl Sync for ReadZarrGroupsInit {}
+unsafe impl Send for ReadZarrTablesInit {}
+unsafe impl Sync for ReadZarrTablesInit {}
 
-pub struct ReadZarrGroupsVTab;
+pub struct ReadZarrTablesVTab;
 
-impl VTab for ReadZarrGroupsVTab {
-    type BindData = ReadZarrGroupsBind;
-    type InitData = ReadZarrGroupsInit;
+impl VTab for ReadZarrTablesVTab {
+    type BindData = ReadZarrTablesBind;
+    type InitData = ReadZarrTablesInit;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         bind.add_result_column("group_path", LogicalTypeId::Varchar.into());
         bind.add_result_column("schema_name", LogicalTypeId::Varchar.into());
         bind.add_result_column("table_name", LogicalTypeId::Varchar.into());
-        bind.add_result_column("dims", LogicalTypeId::Varchar.into());
-        bind.add_result_column("shape", LogicalTypeId::Varchar.into());
-        bind.add_result_column("chunk_shape", LogicalTypeId::Varchar.into());
-        bind.add_result_column("data_vars", LogicalTypeId::Varchar.into());
-        bind.add_result_column("coord_vars", LogicalTypeId::Varchar.into());
+        bind.add_result_column("dims", varchar_list());
+        bind.add_result_column("shape", ubigint_list());
+        bind.add_result_column("chunk_shape", ubigint_list());
+        bind.add_result_column("data_vars", varchar_list());
+        bind.add_result_column("coord_vars", varchar_list());
 
         let store_path = bind.get_parameter(0).to_string();
         let fs = unsafe { extract_file_system(bind) };
@@ -66,18 +67,15 @@ impl VTab for ReadZarrGroupsVTab {
             group_path: tree::display_group(node),
             schema_name: tree::schema_name(node),
             table_name,
-            dims: serde_json::to_string(&table.dims).unwrap_or_default(),
-            shape: serde_json::to_string(&table.shape).unwrap_or_default(),
-            chunk_shape: serde_json::to_string(&table.chunk_shape).unwrap_or_default(),
-            data_vars: serde_json::to_string(&table.variable_paths()).unwrap_or_default(),
-            coord_vars: serde_json::to_string(
-                &table
-                    .coords
-                    .iter()
-                    .map(|(_, path)| path)
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or_default(),
+            dims: table.dims.clone(),
+            shape: table.shape.clone(),
+            chunk_shape: table.chunk_shape.clone(),
+            data_vars: table
+                .variable_paths()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            coord_vars: table.coords.iter().map(|(_, path)| path.clone()).collect(),
         };
 
         let mut rows = Vec::new();
@@ -86,7 +84,7 @@ impl VTab for ReadZarrGroupsVTab {
                 // One array is not a table of its node, so it gets no table name.
                 let (array_name, table) = array_path_table(&store, &array_names, &requested)?;
                 rows.push(row(tree::node_of(&array_name), None, &table));
-                return Ok(ReadZarrGroupsBind { rows });
+                return Ok(ReadZarrTablesBind { rows });
             }
             Selection::Node(node) => {
                 tree::ensure_group_exists(&store_path, &array_names, &node)?;
@@ -116,11 +114,11 @@ impl VTab for ReadZarrGroupsVTab {
             }
         }
 
-        Ok(ReadZarrGroupsBind { rows })
+        Ok(ReadZarrTablesBind { rows })
     }
 
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        Ok(ReadZarrGroupsInit {
+        Ok(ReadZarrTablesInit {
             next: AtomicUsize::new(0),
         })
     }
@@ -141,16 +139,11 @@ impl VTab for ReadZarrGroupsVTab {
         let end = (start + vector_size).min(bind.rows.len());
         let n = end - start;
 
+        let rows = &bind.rows[start..end];
         let v_group = output.flat_vector(0);
         let v_schema = output.flat_vector(1);
         let mut v_table = output.flat_vector(2);
-        let v_dims = output.flat_vector(3);
-        let v_shape = output.flat_vector(4);
-        let v_cshape = output.flat_vector(5);
-        let v_dvars = output.flat_vector(6);
-        let v_cvars = output.flat_vector(7);
-
-        for (i, row) in bind.rows[start..end].iter().enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             use duckdb::core::Inserter;
             v_group.insert(i, row.group_path.as_str());
             v_schema.insert(i, row.schema_name.as_str());
@@ -158,12 +151,14 @@ impl VTab for ReadZarrGroupsVTab {
                 Some(name) => v_table.insert(i, name.as_str()),
                 None => v_table.set_null(i),
             }
-            v_dims.insert(i, row.dims.as_str());
-            v_shape.insert(i, row.shape.as_str());
-            v_cshape.insert(i, row.chunk_shape.as_str());
-            v_dvars.insert(i, row.data_vars.as_str());
-            v_cvars.insert(i, row.coord_vars.as_str());
         }
+        let strings = |f: fn(&TableRow) -> &[String]| rows.iter().map(f).collect::<Vec<_>>();
+        let numbers = |f: fn(&TableRow) -> &[u64]| rows.iter().map(f).collect::<Vec<_>>();
+        write_string_lists(output, 3, &strings(|r| &r.dims));
+        write_u64_lists(output, 4, &numbers(|r| &r.shape));
+        write_u64_lists(output, 5, &numbers(|r| &r.chunk_shape));
+        write_string_lists(output, 6, &strings(|r| &r.data_vars));
+        write_string_lists(output, 7, &strings(|r| &r.coord_vars));
 
         output.set_len(n);
         Ok(())

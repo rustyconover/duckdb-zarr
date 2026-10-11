@@ -57,42 +57,44 @@ The extension does not read `uns`. Read its arrays one at a time with
 
 ## List the tables
 
-`read_zarr_groups` gives one row for each table. `group_path` is the Zarr
+`read_zarr_tables` gives one row for each table. `group_path` is the Zarr
 group, `schema_name` is the DuckDB schema for that group, and `table_name` is
 the table name.
 
 ```sql
 SELECT group_path, schema_name, table_name, dims
-FROM read_zarr_groups('test/fixtures/anndata/pbmc_like.zarr');
+FROM read_zarr_tables('test/fixtures/anndata/pbmc_like.zarr');
 ```
 
 ```text
-/        main    obs                   ["obs"]
-/        main    obs_var               ["obs","var"]
-/        main    var                   ["var"]
-/layers  layers  obs_var               ["obs","var"]
-/obsm    obsm    obs_X_umap_component  ["obs","X_umap_component"]
-/obsp    obsp    obs_i_obs_j           ["obs_i","obs_j"]
-/varp    varp    var_i_var_j           ["var_i","var_j"]
+/        main    obs                   [obs]
+/        main    obs_var               [obs, var]
+/        main    var                   [var]
+/layers  layers  obs_var               [obs, var]
+/obsm    obsm    obs_X_umap_component  [obs, X_umap_component]
+/obsp    obsp    obs_i_obs_j           [obs_i, obs_j]
+/varp    varp    var_i_var_j           [var_i, var_j]
 ```
 
 ## Read a table
 
 `read_zarr` reads the root group. The root has three tables, so use
-`dims :=` to select one. Use `group_path :=` to read another group.
+`table_name :=` to select one by the name `read_zarr_tables` gives it
+(`dims :=` with its dimensions works too). Use `group_path :=` to read another
+group.
 
 ```sql
 -- Cell annotations: one row for each cell
 SELECT obs, cell_type, donor, n_genes
-FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs']);
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs');
 
 -- Gene annotations: one row for each gene
 SELECT var, gene_symbol, mean_expr
-FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['var']);
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'var');
 
 -- The expression matrix: one row for each stored entry
 SELECT obs, var, X
-FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs', 'var']);
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs_var');
 
 -- Two layers of one cell, by name
 SELECT var, spliced, unspliced
@@ -110,19 +112,19 @@ DuckDB, so the quotes are necessary.
 
 Views give each table a stable name, so queries do not repeat `read_zarr`.
 Attach an in-memory database, then create one schema for each group and one
-view for each table. The names come from `read_zarr_groups`.
+view for each table. The names come from `read_zarr_tables`.
 
 ```sql
 ATTACH ':memory:' AS pbmc;
 CREATE VIEW pbmc.main.obs AS
-  SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', dims := ['obs']);
+  SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', table_name := 'obs');
 CREATE VIEW pbmc.main.var AS
-  SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', dims := ['var']);
+  SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', table_name := 'var');
 CREATE VIEW pbmc.main.obs_var AS
-  SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', dims := ['obs', 'var']);
+  SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', table_name := 'obs_var');
 CREATE SCHEMA pbmc.layers;
 CREATE VIEW pbmc.layers.obs_var AS
-  SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'layers', dims := ['obs', 'var']);
+  SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'layers', table_name := 'obs_var');
 ```
 
 A table in `main` needs no schema name: `pbmc.obs` is `pbmc.main.obs`. The
@@ -131,7 +133,7 @@ examples in the rest of this page use these views.
 The views read the store again for each query. If you run many queries,
 `CREATE TABLE ... AS SELECT` copies the data into DuckDB once.
 [docs/design.md](design.md), decision 8, has a query that writes the
-statements for every row of `read_zarr_groups`.
+statements for every row of `read_zarr_tables`.
 
 ## Sparse matrices omit zeros
 
@@ -251,7 +253,7 @@ tables.
   the last value. scipy adds duplicate entries.
 - Sparse matrices with the same dimensions and no dense array beside them
   share a table only if all are CSR or all are CSC. A table that mixes the two
-  has no `table_name` in `read_zarr_groups`; read each matrix with
+  has no `table_name` in `read_zarr_tables`; read each matrix with
   `array_path :=`.
 - If two columns of one data frame differ only in case, or one has the name
   of its axis, they keep their paths as names (`"obs/obs"`), because DuckDB

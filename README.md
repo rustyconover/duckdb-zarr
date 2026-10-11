@@ -37,14 +37,15 @@ GROUP BY month ORDER BY month;
 -- Select one array by its store-relative path (e.g. an OME-Zarr resolution level or nested label)
 SELECT * FROM read_zarr('test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr', array_path='0');
 
--- List a store's tables
-SELECT dims, shape, data_vars FROM read_zarr_groups('test/fixtures/xarray_tutorial/multi_dim_group.zarr');
+-- List a store's tables, then read one by name
+SELECT table_name, dims, data_vars FROM read_zarr_tables('test/fixtures/xarray_tutorial/multi_dim_group.zarr');
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/multi_dim_group.zarr', table_name := 'time_lat_lon') LIMIT 5;
 
 -- Read one group of a nested store (xarray.DataTree.to_zarr, AnnData); the root is the default
 SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine');
 
 -- AnnData: cell annotations (cell_type is an ENUM), one row per cell named in `obs`
-SELECT cell_type, COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs']) GROUP BY ALL;
+SELECT cell_type, COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs') GROUP BY ALL;
 ```
 
 See [docs/design.md](docs/design.md) for the full design,

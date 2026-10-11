@@ -1117,7 +1117,7 @@ def main() -> None:
         print(f"  wrote {dest}")
 
     # ── many_tables (hand-written metadata) ──────────────────────────────────
-    # Tests: read_zarr_groups returns more rows than one DuckDB vector (2048)
+    # Tests: read_zarr_tables returns more rows than one DuckDB vector (2048)
     # holds. 2100 arrays v<i>, each over its own dimension d<i>, are 2100 tables.
     # Metadata only: no chunk is written, so every value is the fill value.
     print("many_tables (synthetic)...")
