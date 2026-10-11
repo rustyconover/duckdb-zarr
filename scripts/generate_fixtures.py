@@ -85,6 +85,7 @@ def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
 # makes the SQL tests fail on value differences that are hard to trace.
 RAGGED_FIXTURE_VERSION = "2"
 DATATREE_FIXTURE_VERSION = "1"
+ERA5_FIXTURE_VERSION = "1"
 MANY_TABLES_FIXTURE_VERSION = "1"
 UNSUPPORTED_FIXTURE_VERSION = "1"
 UNREADABLE_FIXTURE_VERSION = "1"
@@ -841,6 +842,64 @@ def main() -> None:
                       "t": {"chunks": (4,)}, "x27": {"chunks": (10,)}, "u": {"chunks": (3,)},
                       "p": {"chunks": (3, 2)}, "q": {"chunks": (2, 1)}, "qs": {"chunks": (2, 2)}})
         mark_fixture(dest, RAGGED_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── era5_like (synthetic, ARCO-ERA5 layout) ──────────────────────────────
+    # Tests: xarray-sql's ARCO-ERA5 demo (its README and
+    # perf_tests/era5_temp_profile.py) on a small store with the same layout
+    # (test/sql/era5_tables.test). One flat group holds surface variables over
+    # (time, latitude, longitude) and atmospheric variables over (time, level,
+    # latitude, longitude), which read as two tables. The grid is a crop around
+    # New York (0-360 longitudes), so the demo's WHERE clauses select cells.
+    # Values are linear so that every average in the test is exact:
+    #   2m_temperature[t, lat, lon] = 278.15 + t + (lat - 39.5) + (lon - 286.5) / 2
+    #   temperature[t, level]       = 273.15 + level / 100 + t / 2
+    # float32 and one-hour chunks as in ARCO-ERA5, except total_precipitation,
+    # chunked six hours at a time (one table, two chunk grids: decision 6).
+    print("era5_like (synthetic)...")
+    dest = FIXTURES / "era5_like.zarr"
+    if fixture_is_current(dest, ERA5_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        if dest.exists():
+            _rmtree(dest)
+        import pandas as pd
+        time_ = pd.date_range("2020-01-01", periods=12, freq="h")
+        level = np.array([250, 500, 850, 1000], dtype="int64")
+        latitude = np.arange(41.0, 37.9, -0.5, dtype="float32")    # 41.0 .. 38.0
+        longitude = np.arange(285.0, 288.1, 0.5, dtype="float32")  # 285.0 .. 288.0
+        t = np.arange(len(time_))[:, None, None]
+        lat = latitude[None, :, None].astype("float64")
+        lon = longitude[None, None, :].astype("float64")
+        t2m = 278.15 + t + (lat - 39.5) + (lon - 286.5) / 2
+        temp = (273.15 + level[None, :, None, None] / 100 + t[:, None] / 2
+                + np.zeros((1, 1, len(latitude), len(longitude))))
+        surface_dims = ("time", "latitude", "longitude")
+        atmos_dims = ("time", "level", "latitude", "longitude")
+        ds_era5 = xr.Dataset(
+            {
+                "2m_temperature": (surface_dims, t2m.astype("float32"), {"units": "K"}),
+                "10m_u_component_of_wind": (
+                    surface_dims, np.full(t2m.shape, 3.0, dtype="float32"), {"units": "m s**-1"}),
+                "total_precipitation": (
+                    surface_dims, np.full(t2m.shape, 0.001, dtype="float32"), {"units": "m"}),
+                "temperature": (atmos_dims, temp.astype("float32"), {"units": "K"}),
+                "geopotential": (
+                    atmos_dims, (temp * 0 + level[None, :, None, None] * 10.0).astype("float32"),
+                    {"units": "m**2 s**-2"}),
+            },
+            coords={"time": time_, "level": level, "latitude": latitude, "longitude": longitude},
+        )
+        surface_chunks = {"chunks": (1, len(latitude), len(longitude))}
+        atmos_chunks = {"chunks": (1, len(level), len(latitude), len(longitude))}
+        ds_era5.to_zarr(dest, zarr_format=3, consolidated=True, encoding={
+            "2m_temperature": surface_chunks,
+            "10m_u_component_of_wind": surface_chunks,
+            "total_precipitation": {"chunks": (6, len(latitude), len(longitude))},
+            "temperature": atmos_chunks,
+            "geopotential": atmos_chunks,
+        })
+        mark_fixture(dest, ERA5_FIXTURE_VERSION)
         print(f"  wrote {dest}")
 
     # ── many_tables (hand-written metadata) ──────────────────────────────────
