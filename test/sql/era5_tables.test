@@ -41,7 +41,7 @@ main	time_level_latitude_longitude	["time","level","latitude","longitude"]	[1,4,
 statement error
 SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr');
 ----
-contains multiple dimension groups (2)
+group '/' has 2 tables
 
 # ── Register them as era5.surface and era5.atmosphere ─────────────────────────
 # xarray-sql's table_names maps each dimension tuple to a name. Here each view

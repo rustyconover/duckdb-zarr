@@ -18,8 +18,8 @@ use super::consolidated_store::ConsolidatedCacheStore;
 use super::duckdb_store::DuckDbStore;
 use super::tree;
 use super::types::{
-    ColumnDef, ColumnEncoding, CoordArray, DimGroup, FillSentinel, FixedValues, SharedColumnValues,
-    StringValues, WorkUnit, ZarrDtype,
+    ColumnDef, ColumnEncoding, CoordArray, FillSentinel, FixedValues, SharedColumnValues, Storage,
+    StringValues, Table, Variable, WorkUnit, ZarrDtype,
 };
 
 pub type ZarrStore = Arc<dyn ReadableStorageTraits>;
@@ -427,43 +427,69 @@ pub fn first_chunk_shape(arr: &ZarrArray) -> Result<Vec<u64>, Box<dyn std::error
         .collect())
 }
 
-/// Build a one-array dimension group for `read_zarr(..., array_path='path')`.
+/// The table of one array, for `read_zarr(..., array_path='path')`.
 ///
 /// Dimension names come from [`array_path_dims`]. For each declared name, the
 /// coordinate array is looked up in the selected array's parent group first, then
 /// at the store root. A dimension without a coordinate array reads as an integer
 /// index; that is the usual case for OME-Zarr, and always the case for a
 /// synthesized `dim_N`.
-pub fn dim_group_for_array(
+pub fn array_table(
     store: &ZarrStore,
     array_names: &[String],
     array_name: &str,
-) -> Result<DimGroup, Box<dyn std::error::Error>> {
+) -> Result<Table, Box<dyn std::error::Error>> {
     let arr = open_array(store, array_name)?;
     let shape = arr.shape().to_vec();
     let declared = declared_dims(store, &arr, array_name);
     let chunk_shape = first_chunk_shape(&arr)?;
     // A synthesized `dim_N` is a placeholder, not a name any coordinate array was
     // written under, so only look up coordinates for declared names.
-    let (dims, coord_var_names) = match declared {
+    let (dims, coords) = match declared {
         Some(dims) => {
             let coords = dims
                 .iter()
-                .filter_map(|dim| find_coord_array_path(store, array_names, array_name, dim))
+                .filter_map(|dim| {
+                    find_coord_array_path(store, array_names, array_name, dim)
+                        .map(|path| (dim.clone(), path))
+                })
                 .collect();
             (dims, coords)
         }
         None => (synthesize_dim_names(shape.len()), Vec::new()),
     };
 
-    Ok(DimGroup {
-        dims,
-        shape,
-        chunk_shape,
-        data_var_names: vec![array_name.to_string()],
-        coord_var_names,
-        unreadable: Vec::new(),
+    Ok(Table {
+        dims: dims.clone(),
+        shape: shape.clone(),
+        chunk_shape: chunk_shape.clone(),
+        coords,
+        variables: vec![Variable {
+            path: array_name.to_string(),
+            dims: Some(dims),
+            shape,
+            chunk_shape,
+            attrs: arr.attributes().clone(),
+            storage: Storage::Array,
+        }],
     })
+}
+
+/// What `array_path := requested` reads, as its path and its table. With no
+/// listing (a remote store without consolidated metadata) the path is taken as
+/// an array; otherwise it must be one.
+pub fn array_path_table(
+    store: &ZarrStore,
+    array_names: &[String],
+    requested: &str,
+) -> Result<(String, Table), Box<dyn std::error::Error>> {
+    let name = if array_names.is_empty() {
+        requested.to_string()
+    } else {
+        select_array_name(array_names, requested)?
+    };
+    let table = array_table(store, array_names, &name)?;
+    Ok((name, table))
 }
 
 /// The dimension names that `read_zarr(store, array_path := name)` binds.
@@ -851,14 +877,14 @@ pub fn load_coord_array(
     })
 }
 
-/// Build the list of `WorkUnit`s for one dim group.
-pub fn build_work_units(group: &DimGroup) -> Vec<WorkUnit> {
+/// Build the list of `WorkUnit`s for one table: one per cell of its plan grid.
+pub fn build_work_units(table: &Table) -> Vec<WorkUnit> {
     // Number of chunks per dimension.
-    let n_chunks_per_dim: Vec<u64> = group
+    let n_chunks_per_dim: Vec<u64> = table
         .dims
         .iter()
         .enumerate()
-        .map(|(i, _)| group.shape[i].div_ceil(group.chunk_shape[i]))
+        .map(|(i, _)| table.shape[i].div_ceil(table.chunk_shape[i]))
         .collect();
 
     // Total number of chunks.
@@ -881,17 +907,17 @@ pub fn build_work_units(group: &DimGroup) -> Vec<WorkUnit> {
         .collect()
 }
 
-/// Build `ColumnDef`s for one dim group: dims first, then data vars.
+/// Build `ColumnDef`s for one table: dimensions first, then variables.
 pub fn build_column_defs(
     store: &ZarrStore,
-    group: &DimGroup,
+    table: &Table,
     coord_arrays: &HashMap<String, CoordArray>,
     decode_times: bool,
 ) -> Result<Vec<ColumnDef>, Box<dyn std::error::Error>> {
     let mut cols = Vec::new();
 
     // Dimension columns (coords or synthesized integers).
-    for (dim_idx, dim) in group.dims.iter().enumerate() {
+    for (dim_idx, dim) in table.dims.iter().enumerate() {
         if let Some(ca) = coord_arrays.get(dim) {
             cols.push(ColumnDef {
                 name: dim.clone(),
@@ -916,7 +942,8 @@ pub fn build_column_defs(
     }
 
     // Data variable columns.
-    for var_name in &group.data_var_names {
+    for var in &table.variables {
+        let var_name = &var.path;
         let arr = open_array(store, var_name)?;
         let dtype = parse_dtype(&arr, var_name)?;
         let attrs = arr.attributes().clone();
@@ -1023,13 +1050,13 @@ mod tests {
         });
         let names = vec!["X".to_string()];
 
-        let group = dim_group_for_array(&store, &names, "X").unwrap();
-        assert_eq!(group.dims, vec!["dim_0", "dim_1"]);
+        let table = array_table(&store, &names, "X").unwrap();
+        assert_eq!(table.dims, vec!["dim_0", "dim_1"]);
 
         let node = tree::StoreTree::load(&store, &names, None)
             .unwrap()
-            .dim_groups("");
-        assert!(node.groups.is_empty(), "{:?}", node.groups);
+            .tables("");
+        assert!(node.tables.is_empty(), "{:?}", node.tables);
         assert_eq!(node.unnamed, vec!["X"]);
     }
 
@@ -1056,9 +1083,9 @@ mod tests {
             d
         });
         let arr = open_array(&store, "X").unwrap();
-        let group = dim_group_for_array(&store, &["X".to_string()], "X").unwrap();
-        assert_eq!(array_path_dims(&store, &arr, "X"), group.dims);
-        assert_eq!(group.dims, vec!["dim_0", "dim_1"]);
+        let table = array_table(&store, &["X".to_string()], "X").unwrap();
+        assert_eq!(array_path_dims(&store, &arr, "X"), table.dims);
+        assert_eq!(table.dims, vec!["dim_0", "dim_1"]);
     }
 
     #[test]
@@ -1079,13 +1106,9 @@ mod tests {
         );
         let store: ZarrStore = store;
         let names = vec!["g/X".to_string(), "g/dim_0".to_string()];
-        let group = dim_group_for_array(&store, &names, "g/X").unwrap();
-        assert_eq!(group.dims, vec!["dim_0", "dim_1"]);
-        assert!(
-            group.coord_var_names.is_empty(),
-            "{:?}",
-            group.coord_var_names
-        );
+        let table = array_table(&store, &names, "g/X").unwrap();
+        assert_eq!(table.dims, vec!["dim_0", "dim_1"]);
+        assert!(table.coords.is_empty(), "{:?}", table.coords);
     }
 
     #[test]

@@ -153,6 +153,22 @@ SELECT * FROM read_zarr_groups('store.zarr');
 
 Both are read-no-chunks. `read_zarr_metadata` enumerates arrays for inspection and tooling; `read_zarr_groups` lists the tables of every group, with the schema and table name each maps to (decision 8). It is what the multi-group error message points users at, and the input to the mounting recipe in decision 8. Both accept `group_path :=` to look at one node.
 
+## Vocabulary
+
+The code, the docs and the error messages use these terms. Older sections of this document say *dimension group* for what is now called a table.
+
+| Term | Meaning | In DuckDB | In code |
+|---|---|---|---|
+| store | A Zarr hierarchy | A database, mounted by hand (decision 8) | `ZarrStore` |
+| node | A Zarr group, as a node of an `xarray.DataTree` | A schema; the root is `main` | a group path (`""` is the root) |
+| variable | Values over named dimensions, stored as one array | A data column | `Variable` |
+| storage | How a variable's values are stored: one array, or one that zarrs cannot open | | `Storage` |
+| table | The variables of one node that share dimension names and shape | A table (a view) | `Table` |
+| coordinate | The values of a dimension, from an array in the node or an ancestor | A dimension column | `Table::coords` |
+| encoding | How stored values decode: CF packing, CF time | The column's type | `ColumnEncoding` |
+| selection | What a call reads: one node (`group_path :=`), one array (`array_path :=`), or the default | | `Selection` |
+| work unit | One cell of a table's plan grid, the largest chunk in each dimension (decision 6) | One morsel of a parallel scan | `WorkUnit` |
+
 ## Architecture
 
 ```

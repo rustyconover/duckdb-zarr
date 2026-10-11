@@ -3,13 +3,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use duckdb::core::LogicalTypeId;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
+use crate::selection::Selection;
 use crate::zarr_reader::meta::{
-    dim_group_for_array, extract_file_system, list_array_names, open_store, select_array_name,
+    array_path_table, extract_file_system, list_array_names, open_store,
 };
 use crate::zarr_reader::tree::{self, StoreTree};
+use crate::zarr_reader::types::Table;
 
 #[derive(Debug, Clone)]
-struct GroupRow {
+struct TableRow {
     group_path: String,
     schema_name: String,
     /// `None` when `read_zarr(store, group_path := ..., dims := ...)` cannot read
@@ -24,7 +26,7 @@ struct GroupRow {
 }
 
 pub struct ReadZarrGroupsBind {
-    rows: Vec<GroupRow>,
+    rows: Vec<TableRow>,
 }
 
 unsafe impl Send for ReadZarrGroupsBind {}
@@ -59,65 +61,54 @@ impl VTab for ReadZarrGroupsVTab {
         let fs = unsafe { extract_file_system(bind) };
         let store = open_store(&store_path, Some(fs))?;
         let array_names = list_array_names(&store_path, &store)?;
-        let array_path = bind
-            .get_named_parameter("array_path")
-            .map(|value| value.to_string());
-        let array_alias = bind
-            .get_named_parameter("array")
-            .map(|value| value.to_string());
-        if array_path.is_some() && array_alias.is_some() {
-            return Err("use either array_path= or \"array\"=, not both".into());
-        }
-        let requested_group = tree::group_param(bind)?;
-        let requested_array = array_path.or(array_alias);
-        if requested_group.is_some() && requested_array.is_some() {
-            return Err("use either group_path= or array_path=, not both".into());
-        }
-
-        let row =
-            |node: &str, table_name: Option<String>, g: &crate::zarr_reader::types::DimGroup| {
-                GroupRow {
-                    group_path: tree::display_group(node),
-                    schema_name: tree::schema_name(node),
-                    table_name,
-                    dims: serde_json::to_string(&g.dims).unwrap_or_default(),
-                    shape: serde_json::to_string(&g.shape).unwrap_or_default(),
-                    chunk_shape: serde_json::to_string(&g.chunk_shape).unwrap_or_default(),
-                    data_vars: serde_json::to_string(&g.data_var_names).unwrap_or_default(),
-                    coord_vars: serde_json::to_string(&g.coord_var_names).unwrap_or_default(),
-                }
-            };
+        let row = |node: &str, table_name: Option<String>, table: &Table| TableRow {
+            group_path: tree::display_group(node),
+            schema_name: tree::schema_name(node),
+            table_name,
+            dims: serde_json::to_string(&table.dims).unwrap_or_default(),
+            shape: serde_json::to_string(&table.shape).unwrap_or_default(),
+            chunk_shape: serde_json::to_string(&table.chunk_shape).unwrap_or_default(),
+            data_vars: serde_json::to_string(&table.variable_paths()).unwrap_or_default(),
+            coord_vars: serde_json::to_string(
+                &table
+                    .coords
+                    .iter()
+                    .map(|(_, path)| path)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_default(),
+        };
 
         let mut rows = Vec::new();
-        if let Some(requested) = requested_array {
-            // One array is not a table of its group, so it gets no table name.
-            let array_name = select_array_name(&array_names, &requested)?;
-            let g = dim_group_for_array(&store, &array_names, &array_name)?;
-            rows.push(row(tree::node_of(&array_name), None, &g));
-        } else {
-            let store_tree = match &requested_group {
-                Some(node) => {
-                    tree::ensure_group_exists(&store_path, &array_names, node)?;
-                    StoreTree::load_for_node(&store, &array_names, node)?
-                }
-                None => StoreTree::load(&store, &array_names, None)?,
-            };
-            let nodes = match requested_group {
-                Some(node) => vec![node],
-                None => store_tree.nodes(),
-            };
-            for node in nodes {
-                // A row gets a table name only if read_zarr can read it as one
-                // table (its group is aligned with its ancestors, and no array of
-                // another shape in the group shares its dims) and the name is
-                // unique in the group after case folding.
-                let node_groups = store_tree.dim_groups(&node);
-                let aligned = node_groups.misaligned.is_none();
-                let names = tree::table_names(&node_groups.groups);
-                for (g, name) in node_groups.groups.iter().zip(names) {
-                    let readable = aligned && g.unreadable.is_empty();
-                    rows.push(row(&node, name.filter(|_| readable), g));
-                }
+        let (store_tree, nodes) = match Selection::from_bind(bind)? {
+            Selection::Array(requested) => {
+                // One array is not a table of its node, so it gets no table name.
+                let (array_name, table) = array_path_table(&store, &array_names, &requested)?;
+                rows.push(row(tree::node_of(&array_name), None, &table));
+                return Ok(ReadZarrGroupsBind { rows });
+            }
+            Selection::Node(node) => {
+                tree::ensure_group_exists(&store_path, &array_names, &node)?;
+                let store_tree = StoreTree::load_for_node(&store, &array_names, &node)?;
+                (store_tree, vec![node])
+            }
+            Selection::Store => {
+                let store_tree = StoreTree::load(&store, &array_names, None)?;
+                let nodes = store_tree.nodes();
+                (store_tree, nodes)
+            }
+        };
+        for node in nodes {
+            // A row gets a table name only if read_zarr can read it as one table
+            // (its node is aligned with its ancestors, no array of another
+            // shape in the node shares its dims, and zarrs can open all its
+            // arrays) and the name is unique in the node after case folding.
+            let node_tables = store_tree.tables(&node);
+            let aligned = node_tables.misaligned.is_none();
+            let names = tree::table_names(&node_tables.tables);
+            for (table, name) in node_tables.tables.iter().zip(names) {
+                let readable = aligned && table.unreadable().is_empty();
+                rows.push(row(&node, name.filter(|_| readable), table));
             }
         }
 
@@ -179,14 +170,8 @@ impl VTab for ReadZarrGroupsVTab {
     }
 
     fn named_parameters() -> Option<Vec<(String, duckdb::core::LogicalTypeHandle)>> {
-        // DuckDB named parameters are optional. These selectors narrow the
-        // discovered groups when present; omitting both returns all compatible
-        // groups discovered in the store.
-        let mut params = vec![
-            ("array".to_string(), LogicalTypeId::Varchar.into()),
-            ("array_path".to_string(), LogicalTypeId::Varchar.into()),
-        ];
-        params.extend(crate::zarr_reader::tree::group_named_parameters());
-        Some(params)
+        // Optional selectors: one node or one array. Without either, every
+        // node's tables are listed.
+        Some(Selection::named_parameters())
     }
 }

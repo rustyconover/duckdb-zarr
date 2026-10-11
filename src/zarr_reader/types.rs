@@ -132,18 +132,65 @@ pub struct ColumnDef {
     pub dim_idx: Option<usize>,
 }
 
-/// One dim group: arrays sharing an identical ordered dimension set.
-#[derive(Debug)]
-pub struct DimGroup {
+/// A variable of a node, as xarray reads it: values over named dimensions.
+#[derive(Debug, Clone)]
+pub struct Variable {
+    /// Store-relative path, for example `simulation/fine/foo`.
+    pub path: String,
+    /// Dimension names the store records, or `None` when it records none.
+    pub dims: Option<Vec<String>>,
+    pub shape: Vec<u64>,
+    /// The chunk shape of the array that holds the values.
+    pub chunk_shape: Vec<u64>,
+    pub attrs: serde_json::Map<String, serde_json::Value>,
+    pub storage: Storage,
+}
+
+/// How a variable's values are stored.
+#[derive(Debug, Clone)]
+pub enum Storage {
+    /// One Zarr array at the variable's path.
+    Array,
+    /// One Zarr array that zarrs cannot open (unsupported data type or codec),
+    /// with the error. Its shape and names come from its raw metadata document,
+    /// so that its table can say it is missing instead of leaving it out.
+    Unreadable { error: String },
+}
+
+/// A table: the variables of one node that share dimension names and shape,
+/// read as one DuckDB table (decision 8; older sections of the design call it
+/// a dimension group). Its rows are the cells of `shape`, and it has one
+/// column per dimension and one per variable.
+#[derive(Debug, Clone)]
+pub struct Table {
     pub dims: Vec<String>,
     pub shape: Vec<u64>,
+    /// The grid work units follow: the largest chunk length in each dimension
+    /// over the variables (decision 6).
     pub chunk_shape: Vec<u64>,
-    pub data_var_names: Vec<String>,
-    pub coord_var_names: Vec<String>,
-    /// Arrays of this table that zarrs cannot open (unsupported data type or
-    /// codec), with the error. `read_zarr` fails on such a table rather than
-    /// return it without them.
-    pub unreadable: Vec<(String, String)>,
+    /// `(dimension, path)` of the coordinate array of each dimension that has
+    /// one, possibly inherited from an ancestor node.
+    pub coords: Vec<(String, String)>,
+    pub variables: Vec<Variable>,
+}
+
+impl Table {
+    /// The paths of the table's variables, in column order.
+    pub fn variable_paths(&self) -> Vec<&str> {
+        self.variables.iter().map(|v| v.path.as_str()).collect()
+    }
+
+    /// `(path, error)` for each variable zarrs cannot open. `read_zarr` fails
+    /// on a table that has any.
+    pub fn unreadable(&self) -> Vec<(&str, &str)> {
+        self.variables
+            .iter()
+            .filter_map(|v| match &v.storage {
+                Storage::Unreadable { error } => Some((v.path.as_str(), error.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// Decoded element values for one array segment (strategy interface).

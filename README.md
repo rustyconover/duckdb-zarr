@@ -37,7 +37,7 @@ GROUP BY month ORDER BY month;
 -- Select one array by its store-relative path (e.g. an OME-Zarr resolution level or nested label)
 SELECT * FROM read_zarr('test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr', array_path='0');
 
--- List a store's dimension groups
+-- List a store's tables
 SELECT dims, shape, data_vars FROM read_zarr_groups('test/fixtures/xarray_tutorial/multi_dim_group.zarr');
 ```
 
