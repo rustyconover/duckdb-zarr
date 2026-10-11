@@ -1,9 +1,10 @@
 use duckdb::Connection;
 use std::error::Error;
 
+mod list_columns;
 mod read_zarr;
-mod read_zarr_groups;
 mod read_zarr_metadata;
+mod read_zarr_tables;
 mod replacement_scan;
 mod selection;
 mod zarr_reader;
@@ -39,7 +40,9 @@ unsafe fn zarr_init_c_api_internal(
         let con = Connection::open_from_raw(db.cast())?;
         con.register_table_function::<read_zarr::ReadZarrVTab>("read_zarr")?;
         con.register_table_function::<read_zarr_metadata::ReadZarrMetaVTab>("read_zarr_metadata")?;
-        con.register_table_function::<read_zarr_groups::ReadZarrGroupsVTab>("read_zarr_groups")?;
+        con.register_table_function::<read_zarr_tables::ReadZarrTablesVTab>("read_zarr_tables")?;
+        // The 0.1.x name, from before a row was called a table; same function.
+        con.register_table_function::<read_zarr_tables::ReadZarrTablesVTab>("read_zarr_groups")?;
 
         Ok(true)
     }

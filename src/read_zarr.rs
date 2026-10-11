@@ -88,7 +88,26 @@ impl VTab for ReadZarrVTab {
             .get_named_parameter("dims")
             .map(parse_dims_param)
             .transpose()?;
+        // Optional table_name= named parameter (quoted alias "table"=; TABLE
+        // is a DuckDB keyword): a table's name as read_zarr_tables gives it,
+        // e.g. read_zarr(store, table_name := 'time_lat_lon'). Selects the same
+        // table as its dims= list.
+        let requested_table = match (
+            bind.get_named_parameter("table_name"),
+            bind.get_named_parameter("table"),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err("use either table_name= or \"table\"=, not both".into())
+            }
+            (name, alias) => name.or(alias).map(|value| value.to_string()),
+        };
+        if requested_table.is_some() && requested_dims.is_some() {
+            return Err("use either table_name= or dims=, not both".into());
+        }
         let selection = Selection::from_bind(bind)?;
+        if requested_table.is_some() && matches!(selection, Selection::Array(_)) {
+            return Err("use either table_name= or array_path=, not both".into());
+        }
 
         // Mirrors xarray.open_zarr's decode_times=: on by default, opt out to see
         // the raw CF offsets instead of TIMESTAMPs.
@@ -157,49 +176,21 @@ impl VTab for ReadZarrVTab {
             return Err(msg.into());
         }
 
-        let available = || {
-            let mut dims: Vec<&Vec<String>> = tables.iter().map(|t| &t.dims).collect();
-            dims.dedup();
-            dims
-        };
-        let wanted: &[String] = match &requested_dims {
-            Some(dims) => dims,
-            None => {
-                let distinct = available();
-                if distinct.len() > 1 {
-                    return Err(format!(
-                        "'{store_path}': group '{shown}' has {} tables {distinct:?}; use dims= \
-                         to select one, or array_path= to read one array",
-                        distinct.len()
-                    )
-                    .into());
-                }
-                &tables[0].dims
-            }
-        };
-        let matching: Vec<&Table> = tables.iter().filter(|t| t.dims == wanted).collect();
-        let table = match matching.as_slice() {
-            [] => {
-                return Err(format!(
-                    "'{store_path}': no table in group '{shown}' has dims={wanted:?}; \
-                     available: {:?}",
-                    available()
+        let table = match &requested_table {
+            Some(name) => table_named(tables, name).ok_or_else(|| {
+                format!(
+                    "'{store_path}': group '{shown}' has no table named '{name}'; its tables \
+                     are {:?}. A table without a name (NULL in read_zarr_tables) is read with \
+                     dims=",
+                    tree::table_names(tables)
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
                 )
-                .into())
-            }
-            [table] => *table,
-            [a, b, ..] => {
-                return Err(format!(
-                    "arrays of different shapes share dims {wanted:?}: {:?} {:?} vs {:?} {:?}; \
-                     use array_path= to read one array",
-                    a.variable_paths(),
-                    a.shape,
-                    b.variable_paths(),
-                    b.shape
-                )
-                .into());
-            }
+            })?,
+            None => table_with_dims(tables, requested_dims.as_deref(), &store_path, &shown)?,
         };
+        let wanted = &table.dims;
 
         // Leaving an array out would return the table without it and no sign
         // that it is missing.
@@ -323,6 +314,8 @@ impl VTab for ReadZarrVTab {
                 "dims".to_string(),
                 LogicalTypeHandle::list(&LogicalTypeId::Varchar.into()),
             ),
+            ("table_name".to_string(), LogicalTypeId::Varchar.into()),
+            ("table".to_string(), LogicalTypeId::Varchar.into()),
             ("decode_times".to_string(), LogicalTypeId::Boolean.into()),
         ];
         params.extend(Selection::named_parameters());
@@ -333,6 +326,71 @@ impl VTab for ReadZarrVTab {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The table of a node that `name` names, as `read_zarr_tables` names it
+/// (DuckDB identifiers ignore case).
+fn table_named<'a>(tables: &'a [Table], name: &str) -> Option<&'a Table> {
+    let names = tree::table_names(tables);
+    tables
+        .iter()
+        .zip(names)
+        .find(|(_, n)| n.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+        .map(|(table, _)| table)
+}
+
+/// The table of a node with dimensions `requested`, or the node's only table
+/// when none are requested.
+fn table_with_dims<'a>(
+    tables: &'a [Table],
+    requested: Option<&[String]>,
+    store_path: &str,
+    shown: &str,
+) -> Result<&'a Table, Box<dyn std::error::Error>> {
+    let available = || {
+        let mut dims: Vec<&Vec<String>> = tables.iter().map(|t| &t.dims).collect();
+        dims.dedup();
+        dims
+    };
+    let wanted: &[String] = match requested {
+        Some(dims) => dims,
+        None => {
+            let distinct = available();
+            if distinct.len() > 1 {
+                return Err(format!(
+                    "'{store_path}': group '{shown}' has {} tables {distinct:?}; use table_name= \
+             or dims= to select one, or array_path= to read one array",
+                    distinct.len()
+                )
+                .into());
+            }
+            &tables[0].dims
+        }
+    };
+    let matching: Vec<&Table> = tables.iter().filter(|t| t.dims == wanted).collect();
+    let table = match matching.as_slice() {
+        [] => {
+            return Err(format!(
+                "'{store_path}': no table in group '{shown}' has dims={wanted:?}; \
+             available: {:?}",
+                available()
+            )
+            .into())
+        }
+        [table] => *table,
+        [a, b, ..] => {
+            return Err(format!(
+                "arrays of different shapes share dims {wanted:?}: {:?} {:?} vs {:?} {:?}; \
+             use array_path= to read one array",
+                a.variable_paths(),
+                a.shape,
+                b.variable_paths(),
+                b.shape
+            )
+            .into());
+        }
+    };
+    Ok(table)
+}
 
 /// Extract the ordered dimension names from a `dims` named-parameter value.
 ///
