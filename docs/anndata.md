@@ -168,6 +168,10 @@ row only where a matrix stores a value. A missing row means the value is 0.
 This store has 27 stored entries in a matrix of 160 cells, so the `X` table has
 27 rows.
 
+A matrix can store one position more than once if it was written without
+scipy's `sum_duplicates()`. That position gives one row, with the sum of the
+entries, as in scipy and anndata.
+
 For this reason, `AVG(X)` over the `X` table is a mean over the stored entries
 only. To get a mean over cells, start from `obs` and use a `LEFT JOIN`. Each
 cell then has one row, and `COALESCE` gives 0 to the cells that have no entry:
@@ -275,8 +279,6 @@ tables.
   `encoding-type: anndata`. An old store that has no `encoding-type`
   attributes reads only with `array_path :=`.
 - The extension does not read `uns`, awkward arrays, or MuData stores.
-- A sparse matrix with duplicate entries for one position gives one row with
-  the last value. scipy adds duplicate entries.
 - Sparse matrices with the same dimensions and no dense array beside them
   share a table only if all are CSR or all are CSC. A table that mixes the two
   has no `table_name` in `read_zarr_tables`; read each matrix with

@@ -85,7 +85,7 @@ def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
 # otherwise it is rebuilt. Without this, a copy left over from an older checkout
 # makes the SQL tests fail on value differences that are hard to trace.
 ANNDATA_FIXTURE_VERSION = "6"
-AXIS_NAMED_FIXTURE_VERSION = "3"
+AXIS_NAMED_FIXTURE_VERSION = "4"
 RAGGED_FIXTURE_VERSION = "2"
 DATATREE_FIXTURE_VERSION = "1"
 ERA5_FIXTURE_VERSION = "1"
@@ -901,7 +901,12 @@ def main() -> None:
     #   * obsm/df, a data frame with a column `obs`;
     #   * layers a (CSR) and b (CSC) only: a sparse table that mixes storage;
     #   * obsp d (dense, chunks (2, 2)), r (CSR) and c (CSC), all 3x3: sparse
-    #     matrices of both kinds densified beside a dense array.
+    #     matrices of both kinds densified beside a dense array;
+    #   * obsm/spatial_bounds, an embedding of 2 components whose name matches
+    #     the CF bounds pattern (*_bounds, shape (N, 2)); it is data;
+    #   * obsp/dup and varp/dup, CSR matrices that store one position twice and
+    #     out of order (no sum_duplicates()); anndata reads it as the sum:
+    #     obsp/dup[0, 2] = 1 + 2 and varp/dup[0, 1] = 1 + 2.
     print("anndata/axis_named_columns (real anndata writer)...")
     dest = ANNDATA_FIXTURES / "axis_named_columns.zarr"
     if fixture_is_current(dest, AXIS_NAMED_FIXTURE_VERSION):
@@ -916,17 +921,26 @@ def main() -> None:
         obs = pd.DataFrame({"obs": np.arange(3, dtype=np.int64) * 10,
                             "Obs": np.arange(3, dtype=np.int64) + 1}, index=names)
         dense = np.arange(9, dtype=np.float64).reshape(3, 3)
+
+        def duplicated(data, indices, indptr, n):
+            m = scipy.sparse.csr_matrix((np.array(data), np.array(indices, dtype=np.int32),
+                                         np.array(indptr, dtype=np.int32)), shape=(n, n))
+            assert not m.has_canonical_format
+            return m
         with ad.settings.override(zarr_write_format=3):
             ad.AnnData(
                 X=np.ones((3, 2), dtype=np.float32), obs=obs,
                 var=pd.DataFrame(index=["g0", "g1"]),
                 obsm={"df": pd.DataFrame({"obs": np.array([5, 6, 7], dtype=np.int64)},
-                                         index=names)},
+                                         index=names),
+                      "spatial_bounds": np.arange(6, dtype=np.float64).reshape(3, 2)},
                 layers={"a": scipy.sparse.csr_matrix(np.array([[1., 0.], [0., 0.], [0., 2.]])),
                         "b": scipy.sparse.csc_matrix(np.array([[0., 3.], [0., 0.], [4., 0.]]))},
                 obsp={"d": dense,
                       "r": scipy.sparse.csr_matrix(np.where(dense % 2 == 0, dense, 0.0)),
-                      "c": scipy.sparse.csc_matrix(np.where(dense % 3 == 0, dense, 0.0))},
+                      "c": scipy.sparse.csc_matrix(np.where(dense % 3 == 0, dense, 0.0)),
+                      "dup": duplicated([1., 2., 4.], [2, 2, 0], [0, 2, 2, 3], 3)},
+                varp={"dup": duplicated([1., 2., 5.], [1, 1, 0], [0, 2, 3], 2)},
             ).write_zarr(dest)
         # Chunk obsp/d as (2, 2): its table then has 4 work units, so r (CSR, its
         # row ranges shared across units) and c (CSC, read per unit because the

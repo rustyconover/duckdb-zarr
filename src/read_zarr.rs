@@ -543,10 +543,19 @@ fn finish_bind(
         )
         .into());
     }
-    // Load coord arrays.
+    // Load each coordinate array once, even when two dimensions share it
+    // (obsp's obs_i and obs_j are both obs/_index); clones share the values.
     let mut coord_arrays: HashMap<String, CoordArray> = HashMap::new();
+    let mut loaded: HashMap<&str, CoordArray> = HashMap::new();
     for (dim, coord_name) in &table.coords {
-        let ca = load_coord_array(&store, coord_name, decode_times)?;
+        let ca = match loaded.get(coord_name.as_str()) {
+            Some(ca) => ca.clone(),
+            None => {
+                let ca = load_coord_array(&store, coord_name, decode_times)?;
+                loaded.insert(coord_name, ca.clone());
+                ca
+            }
+        };
         coord_arrays.insert(dim.clone(), ca);
     }
 
@@ -562,13 +571,13 @@ fn finish_bind(
     // name equals, ignoring case, a dimension of the table (an AnnData obs
     // column called `obs` or `Obs`) or an earlier column (`A` and `a`) keeps its
     // store path instead (`obs/obs`), as array_path= names it.
-    let mut used: HashSet<String> = table.dims.iter().map(|d| d.to_lowercase()).collect();
+    let mut used: HashSet<String> = table.dims.iter().map(|d| tree::fold_case(d)).collect();
     for col in &columns {
         let duckdb_type = col.on_disk_dtype.to_duckdb_type(&col.encoding);
         let basename = tree::basename(&col.name);
         let collides = matches!(names, ColumnNames::Basename)
             && !col.is_coord
-            && used.contains(&basename.to_lowercase());
+            && used.contains(&tree::fold_case(basename));
         let name = match names {
             ColumnNames::Basename if !collides => basename,
             _ => col.name.as_str(),
@@ -580,14 +589,14 @@ fn finish_bind(
                 name.to_string()
             };
         // Paths can collide too (`obs/obs` and `obs/Obs`); number the later one.
-        if collides && used.contains(&display_name.to_lowercase()) {
+        if collides && used.contains(&tree::fold_case(&display_name)) {
             display_name = (1..)
                 .map(|n| format!("{name}_{n}"))
-                .find(|candidate| !used.contains(&candidate.to_lowercase()))
+                .find(|candidate| !used.contains(&tree::fold_case(candidate)))
                 .expect("an unused suffix exists");
         }
         if !col.is_coord {
-            used.insert(display_name.to_lowercase());
+            used.insert(tree::fold_case(&display_name));
         }
         bind.add_result_column(&display_name, duckdb_type);
     }

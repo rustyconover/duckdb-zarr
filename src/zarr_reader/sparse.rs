@@ -6,6 +6,12 @@
 //! scattered into each dense chunk instead, since that table has a row for
 //! every cell anyway. In both cases a cell a matrix does not store reads as 0,
 //! which is its value.
+//!
+//! A matrix may store one position more than once, or out of order, if it was
+//! written without scipy's `sum_duplicates()`. scipy and anndata read such a
+//! position as the sum of its entries, and so does this module. Each decoded
+//! range is checked for that (`canonical`); a canonical range, the usual
+//! case, skips the summing and sorting.
 
 use super::meta::{open_array, parse_dtype, ZarrArray, ZarrStore};
 use super::types::{SparseMatrix, ZarrDtype};
@@ -20,6 +26,9 @@ pub struct MajorRange {
     m1: u64,
     indices: Vec<u64>,
     data: Vec<u8>,
+    /// Whether every major index in the range has strictly increasing minor
+    /// indices, so no position is stored twice ([`SparseInput::canonical`]).
+    canonical: bool,
 }
 
 /// One sparse matrix, opened at bind time with its whole `indptr` in memory.
@@ -116,8 +125,22 @@ impl SparseInput {
         Ok(MajorRange {
             m0,
             m1,
+            canonical: self.canonical(m0, m1, &indices),
             indices,
             data: data.expect("requested data"),
+        })
+    }
+
+    /// Whether the stored entries of the major range `m0..m1`, whose minor
+    /// `indices` are given, are strictly increasing in each major index, as in
+    /// a canonical scipy matrix. Then no position is stored twice.
+    fn canonical(&self, m0: u64, m1: u64, indices: &[u64]) -> bool {
+        let base = self.indptr[m0 as usize];
+        (m0 as usize..m1 as usize).all(|m| {
+            let (start, end) = (self.indptr[m] - base, self.indptr[m + 1] - base);
+            indices[start as usize..end as usize]
+                .windows(2)
+                .all(|w| w[0] < w[1])
         })
     }
 
@@ -133,10 +156,29 @@ impl SparseInput {
         debug_assert_eq!(m0, range.m0, "major range does not start at the chunk");
         let (lo, hi) = (origin[minor], origin[minor] + chunk_shape[minor]);
         let base = self.indptr[range.m0 as usize];
+        // Which cells hold a value already, to sum a position stored twice.
+        // A canonical range stores each position once and needs no record.
+        let mut written = if range.canonical {
+            Vec::new()
+        } else {
+            vec![false; out.len() / size]
+        };
         for m in range.m0..range.m1 {
-            let (start, end) = (self.indptr[m as usize], self.indptr[m as usize + 1]);
-            for pos in (start - base)..(end - base) {
-                let j = range.indices[pos as usize];
+            let start = (self.indptr[m as usize] - base) as usize;
+            let end = (self.indptr[m as usize + 1] - base) as usize;
+            // Sorted indices locate the chunk's columns by binary search, so
+            // each chunk across the range reads only its own entries.
+            let (from, to) = if range.canonical {
+                let row = &range.indices[start..end];
+                (
+                    start + row.partition_point(|&j| j < lo),
+                    start + row.partition_point(|&j| j < hi),
+                )
+            } else {
+                (start, end)
+            };
+            for pos in from..to {
+                let j = range.indices[pos];
                 if j < lo || j >= hi {
                     continue;
                 }
@@ -144,8 +186,16 @@ impl SparseInput {
                 local[major] = m - m0;
                 local[minor] = j - lo;
                 let flat = (local[0] * chunk_shape[1] + local[1]) as usize;
-                let src = pos as usize * size;
-                out[flat * size..(flat + 1) * size].copy_from_slice(&range.data[src..src + size]);
+                let src = &range.data[pos * size..(pos + 1) * size];
+                let dst = &mut out[flat * size..(flat + 1) * size];
+                if !range.canonical && written[flat] {
+                    add_value(&self.dtype, dst, src);
+                } else {
+                    dst.copy_from_slice(src);
+                    if !range.canonical {
+                        written[flat] = true;
+                    }
+                }
             }
         }
         out
@@ -204,11 +254,30 @@ pub fn decode_block(
     for (input, &with_data) in inputs.iter().zip(projected) {
         decoded.push(input.entries(m0, m1, with_data)?);
     }
+    // One canonical matrix, the usual case (X or obsp alone): its entries are
+    // already the rows, in order.
+    if inputs.len() == 1 && inputs[0].canonical(m0, m1, &decoded[0].0) {
+        let input = inputs[0];
+        let (minor, values) = decoded.pop().expect("one matrix");
+        let mut major = Vec::with_capacity(minor.len());
+        for m in m0..m1 {
+            let count = input.indptr[m as usize + 1] - input.indptr[m as usize];
+            major.extend(std::iter::repeat_n(m, count as usize));
+        }
+        return Ok(SparseBlock {
+            major,
+            minor,
+            values: vec![values],
+        });
+    }
     let mut block = SparseBlock {
         values: projected.iter().map(|&p| p.then(Vec::new)).collect(),
         ..Default::default()
     };
     let mut row: Vec<(u64, usize, usize)> = Vec::new();
+    // Which matrices have a value at the current position, to sum a position
+    // a matrix stores twice.
+    let mut seen = vec![false; inputs.len()];
     for m in m0..m1 {
         // (minor index, matrix, entry position) for every stored entry in m.
         row.clear();
@@ -230,18 +299,52 @@ pub fn decode_block(
                     values.resize(values.len() + inputs[v].elem_size(), 0);
                 }
             }
+            seen.fill(false);
             while i < row.len() && row[i].0 == minor {
                 let (_, v, pos) = row[i];
                 if let (Some(values), Some(data)) = (&mut block.values[v], &decoded[v].1) {
                     let size = inputs[v].elem_size();
                     let dst = values.len() - size;
-                    values[dst..].copy_from_slice(&data[pos * size..(pos + 1) * size]);
+                    let src = &data[pos * size..(pos + 1) * size];
+                    if seen[v] {
+                        add_value(&inputs[v].dtype, &mut values[dst..], src);
+                    } else {
+                        values[dst..].copy_from_slice(src);
+                    }
                 }
+                seen[v] = true;
                 i += 1;
             }
         }
     }
     Ok(block)
+}
+
+/// `dst += src` for one native-endian value of `dtype`, as numpy adds when
+/// scipy sums duplicate entries: integers wrap, booleans OR.
+fn add_value(dtype: &ZarrDtype, dst: &mut [u8], src: &[u8]) {
+    macro_rules! add {
+        ($t:ty, $add:expr) => {{
+            let a = <$t>::from_ne_bytes(dst.try_into().expect("one value"));
+            let b = <$t>::from_ne_bytes(src.try_into().expect("one value"));
+            let add: fn($t, $t) -> $t = $add;
+            dst.copy_from_slice(&add(a, b).to_ne_bytes());
+        }};
+    }
+    match dtype {
+        ZarrDtype::Bool => dst[0] |= src[0],
+        ZarrDtype::Int8 => add!(i8, i8::wrapping_add),
+        ZarrDtype::Int16 => add!(i16, i16::wrapping_add),
+        ZarrDtype::Int32 => add!(i32, i32::wrapping_add),
+        ZarrDtype::Int64 => add!(i64, i64::wrapping_add),
+        ZarrDtype::UInt8 => add!(u8, u8::wrapping_add),
+        ZarrDtype::UInt16 => add!(u16, u16::wrapping_add),
+        ZarrDtype::UInt32 => add!(u32, u32::wrapping_add),
+        ZarrDtype::UInt64 => add!(u64, u64::wrapping_add),
+        ZarrDtype::Float32 => add!(f32, |a, b| a + b),
+        ZarrDtype::Float64 => add!(f64, |a, b| a + b),
+        ZarrDtype::String => unreachable!("sparse data has a fixed-width dtype"),
+    }
 }
 
 /// Read `arr[start..end]` of a 1-D integer array (a sparse matrix's `indices`
@@ -442,6 +545,73 @@ mod tests {
         assert_eq!(floats(&chunk), vec![1., 0., 0., 0., 0., 0.]);
         let chunk = a.dense_chunk(&rows, &[0, 3], &[2, 3]);
         assert_eq!(floats(&chunk), vec![2., 0., 0., 0., 0., 0.]);
+    }
+
+    fn rows_of(block: &SparseBlock, v: usize) -> Vec<(u64, u64, f32)> {
+        let values = floats(block.values[v].as_ref().unwrap());
+        (0..block.len())
+            .map(|i| (block.major[i], block.minor[i], values[i]))
+            .collect()
+    }
+
+    #[test]
+    fn one_canonical_matrix_reads_its_entries_in_order() {
+        let inner = MemoryStore::new();
+        // Rows 1 and 3 store nothing.
+        let a = csr(&inner, "a", [4, 5], &[(0, 1, 1.), (0, 4, 2.), (2, 0, 3.)]);
+        let store: ZarrStore = Arc::new(inner);
+        let a = SparseInput::open(&store, "a", &a).unwrap();
+        let block = decode_block(&[&a], (0, 4), &[true]).unwrap();
+        assert_eq!(rows_of(&block, 0), vec![(0, 1, 1.), (0, 4, 2.), (2, 0, 3.)]);
+        let block = decode_block(&[&a], (1, 2), &[true]).unwrap();
+        assert_eq!(block.len(), 0);
+        let block = decode_block(&[&a], (0, 4), &[false]).unwrap();
+        assert_eq!((block.len(), block.values[0].is_none()), (3, true));
+    }
+
+    #[test]
+    fn a_position_stored_twice_reads_as_the_sum() {
+        let inner = MemoryStore::new();
+        // Row 0 stores column 3 twice, out of order, as scipy allows before
+        // sum_duplicates(); scipy reads it as 1 + 2.
+        let a = csr(
+            &inner,
+            "a",
+            [2, 5],
+            &[(0, 3, 1.), (0, 0, 4.), (0, 3, 2.), (1, 1, 5.)],
+        );
+        let b = csr(&inner, "b", [2, 5], &[(0, 3, 10.)]);
+        let store: ZarrStore = Arc::new(inner);
+        let a = SparseInput::open(&store, "a", &a).unwrap();
+        let b = SparseInput::open(&store, "b", &b).unwrap();
+        let expected = vec![(0, 0, 4.), (0, 3, 3.), (1, 1, 5.)];
+        assert_eq!(
+            rows_of(&decode_block(&[&a], (0, 2), &[true]).unwrap(), 0),
+            expected
+        );
+        let both = decode_block(&[&a, &b], (0, 2), &[true, true]).unwrap();
+        assert_eq!(rows_of(&both, 0), expected);
+        assert_eq!(floats(both.values[1].as_ref().unwrap()), vec![0., 10., 0.]);
+
+        let range = a.major_range(0, 2).unwrap();
+        assert!(!range.canonical);
+        let chunk = a.dense_chunk(&range, &[0, 0], &[2, 5]);
+        assert_eq!(floats(&chunk), vec![4., 0., 0., 3., 0., 0., 5., 0., 0., 0.]);
+        let chunk = a.dense_chunk(&range, &[0, 2], &[2, 2]);
+        assert_eq!(floats(&chunk), vec![0., 3., 0., 0.]);
+    }
+
+    #[test]
+    fn duplicates_add_like_numpy() {
+        let mut v = 250u8.to_ne_bytes();
+        add_value(&ZarrDtype::UInt8, &mut v, &10u8.to_ne_bytes());
+        assert_eq!(u8::from_ne_bytes(v), 4);
+        let mut v = [1u8];
+        add_value(&ZarrDtype::Bool, &mut v, &[1]);
+        assert_eq!(v, [1]);
+        let mut v = 1.5f64.to_ne_bytes();
+        add_value(&ZarrDtype::Float64, &mut v, &2.25f64.to_ne_bytes());
+        assert_eq!(f64::from_ne_bytes(v), 3.75);
     }
 
     #[test]

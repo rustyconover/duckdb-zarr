@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use super::meta::{first_chunk_shape, open_array, ZarrStore};
+use super::meta::{first_chunk_shape, open_array, synthesize_dim_names, ZarrStore};
 use super::tree::{basename, display_group, join, node_of, self_and_ancestors};
 use super::types::{SparseMatrix, Storage, Table, Variable};
 
@@ -281,6 +281,43 @@ pub fn variable_storage(
     }))
 }
 
+/// The variable that the AnnData encoded group at `path` holds (a sparse
+/// matrix, a categorical or a nullable column), or `None` if `encoding` is not
+/// one of those. Shape and chunks come from the array that holds the values; a
+/// sparse matrix is read by ranges of its major axis, so its chunk shape is
+/// its shape. An error opening the values array is returned as is, for the
+/// caller to tell an unsupported array from a failure.
+pub fn encoded_variable(
+    store: &ZarrStore,
+    layout: &Layout,
+    path: &str,
+    encoding: &str,
+) -> Result<Option<Variable>, Box<dyn std::error::Error>> {
+    let Some(storage) = variable_storage(layout, path, encoding)? else {
+        return Ok(None);
+    };
+    let (shape, chunk_shape) = match &storage {
+        Storage::Sparse(matrix) => (matrix.shape.clone(), matrix.shape.clone()),
+        _ => {
+            let values = storage
+                .values_array(path)
+                .expect("an AnnData group variable");
+            let arr = open_array(store, values)?;
+            (arr.shape().to_vec(), first_chunk_shape(&arr)?)
+        }
+    };
+    Ok(Some(Variable {
+        path: path.to_string(),
+        node: layout.node_of(path),
+        dims: axis_names(path, shape.len(), |g| layout.encoding_of(g)),
+        shape,
+        chunk_shape,
+        attrs: Default::default(),
+        storage,
+        in_dataframe: layout.is_frame_column(path),
+    }))
+}
+
 /// The one-variable table that `array_path=` reads for an AnnData encoded
 /// variable (a sparse matrix, a categorical or a nullable column), or `None` if
 /// `path` is not one, or lies inside another. Its dimensions are named as in
@@ -295,36 +332,20 @@ pub fn variable_table(
         return Ok(None);
     }
     let encoding = layout.encoding_of(path).unwrap_or_default();
-    let Some(storage) = variable_storage(layout, path, &encoding)? else {
+    let Some(mut variable) = encoded_variable(store, layout, path, &encoding)? else {
         return Ok(None);
     };
-    let (shape, chunk_shape) = match &storage {
-        Storage::Sparse(matrix) => (matrix.shape.clone(), matrix.shape.clone()),
-        _ => {
-            let values = storage
-                .values_array(path)
-                .expect("an AnnData group variable");
-            let arr = open_array(store, values)?;
-            (arr.shape().to_vec(), first_chunk_shape(&arr)?)
-        }
-    };
-    let dims = axis_names(path, shape.len(), |g| layout.encoding_of(g))
-        .unwrap_or_else(|| (0..shape.len()).map(|i| format!("dim_{i}")).collect());
+    let dims = variable
+        .dims
+        .clone()
+        .unwrap_or_else(|| synthesize_dim_names(variable.shape.len()));
+    variable.dims = Some(dims.clone());
     Ok(Some(Table {
-        dims: dims.clone(),
-        shape: shape.clone(),
-        chunk_shape: chunk_shape.clone(),
+        dims,
+        shape: variable.shape.clone(),
+        chunk_shape: variable.chunk_shape.clone(),
         coords: Vec::new(),
-        variables: vec![Variable {
-            path: path.to_string(),
-            node: layout.node_of(path),
-            dims: Some(dims),
-            shape,
-            chunk_shape,
-            attrs: Default::default(),
-            storage,
-            in_dataframe: layout.is_frame_column(path),
-        }],
+        variables: vec![variable],
     }))
 }
 

@@ -181,6 +181,57 @@ FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', group_path := 'o
 ----
 9	36.000000	20.000000	9.000000	0
 
+# obsp/dup stores [0, 2] twice (1 and 2) and out of order, as a matrix written
+# without scipy's sum_duplicates(); anndata reads the sum, and so does the
+# dense read beside obsp/d.
+query TTR
+SELECT obs_i, obs_j, dup FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', group_path := 'obsp')
+WHERE dup != 0 ORDER BY ALL;
+----
+c0	c2	3.000000
+c2	c0	4.000000
+
+# varp/dup alone is a table of stored entries: one row for [0, 1], summed.
+query TTR
+SELECT var_i, var_j, dup FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', group_path := 'varp')
+ORDER BY ALL;
+----
+g0	g1	3.000000
+g1	g0	5.000000
+
+# An embedding named like a CF bounds variable (*_bounds, two components) is
+# data in an AnnData store, not a bounds variable left out of every table.
+query TTT
+SELECT table_name, data_vars, coord_vars FROM read_zarr_tables('test/fixtures/anndata/axis_named_columns.zarr', group_path := 'obsm');
+----
+obs_spatial_bounds_component	[obsm/spatial_bounds]	[obs/_index/values]
+
+query T
+SELECT role FROM read_zarr_metadata('test/fixtures/anndata/axis_named_columns.zarr', array_path := 'obsm/spatial_bounds');
+----
+data
+
+query TR
+SELECT obs, SUM(spatial_bounds) FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', group_path := 'obsm')
+GROUP BY obs ORDER BY obs;
+----
+c0	1.000000
+c1	5.000000
+c2	9.000000
+
+# array_path= on an obs column or categorical reports the group its table is
+# in: the root, where obs folds, not the obs group that stores it.
+query TTT
+SELECT group_path, schema_name, dims FROM read_zarr_tables('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/n_genes')
+UNION ALL
+SELECT group_path, schema_name, dims FROM read_zarr_tables('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type')
+UNION ALL
+SELECT group_path, schema_name, dims FROM read_zarr_tables('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obsm/X_umap');
+----
+/	main	[obs]
+/	main	[obs]
+/obsm	obsm	[obs, X_umap_component]
+
 # group_path= cannot name an encoded variable; every function says so.
 statement error
 SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'X');

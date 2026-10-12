@@ -114,7 +114,12 @@ impl VTab for ReadZarrMetaVTab {
                 Some((name.as_str(), arr.attributes(), arr.shape()))
             })
             .collect();
-        let (aux_coords, bounds_vars) = cf_auxiliary_vars(&facts);
+        // As in StoreTree::tables, CF rules do not apply to AnnData.
+        let (aux_coords, bounds_vars) = if layout.is_some() {
+            Default::default()
+        } else {
+            cf_auxiliary_vars(&facts)
+        };
 
         let mut rows = Vec::new();
         for &(name, ref arr) in &opened {

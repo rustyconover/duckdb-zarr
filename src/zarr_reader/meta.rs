@@ -399,9 +399,14 @@ pub fn array_path_table(
     array_names: &[String],
     requested: &str,
 ) -> Result<(String, Table), Box<dyn std::error::Error>> {
-    if !array_names.is_empty() && !array_names.iter().any(|n| n == requested) {
-        if let Some(layout) = anndata::layout(store, array_names) {
-            if let Some(table) = anndata::variable_table(store, &layout, requested)? {
+    let layout = if array_names.is_empty() {
+        None
+    } else {
+        anndata::layout(store, array_names)
+    };
+    if let Some(layout) = &layout {
+        if !array_names.iter().any(|n| n == requested) {
+            if let Some(table) = anndata::variable_table(store, layout, requested)? {
                 return Ok((requested.to_string(), table));
             }
         }
@@ -411,7 +416,15 @@ pub fn array_path_table(
     } else {
         select_array_name(array_names, requested)?
     };
-    let table = array_table(store, array_names, &name)?;
+    let mut table = array_table(store, array_names, &name)?;
+    // In an AnnData store an obs or var column belongs to the root, where its
+    // data frame folds (decision 9), not to the group that stores it.
+    if let Some(layout) = &layout {
+        for var in &mut table.variables {
+            var.node = layout.node_of(&var.path);
+            var.in_dataframe = layout.is_frame_column(&var.path);
+        }
+    }
     Ok((name, table))
 }
 
@@ -666,7 +679,7 @@ fn fallback_dim_name(i: usize) -> String {
 /// enumeration ([`tree::StoreTree`]) must not use this: two unrelated arrays of the
 /// same length would both get `dim_0` and be joined row by row as if they shared an
 /// axis.
-fn synthesize_dim_names(ndim: usize) -> Vec<String> {
+pub fn synthesize_dim_names(ndim: usize) -> Vec<String> {
     (0..ndim).map(fallback_dim_name).collect()
 }
 

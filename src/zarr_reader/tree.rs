@@ -194,40 +194,16 @@ impl StoreTree {
             if !anndata_layout.is_variable(group) || !wanted(group) || inside_variable(group) {
                 continue;
             }
-            let Some(storage) = anndata::variable_storage(anndata_layout, group, encoding)? else {
-                continue;
-            };
-            // Shape and chunks come from the array that holds the values.
-            let (shape, chunk_shape) = match &storage {
-                Storage::Sparse(matrix) => (matrix.shape.clone(), matrix.shape.clone()),
-                _ => {
-                    let values = storage
-                        .values_array(group)
-                        .expect("an AnnData group variable");
-                    match open_array(store, values) {
-                        Ok(arr) => (arr.shape().to_vec(), first_chunk_shape(&arr)?),
-                        Err(err) if is_unsupported_array_error(err.as_ref()) => {
-                            tree.unsupported.push(group.clone());
-                            continue;
-                        }
-                        Err(err) => return Err(err),
-                    }
+            match anndata::encoded_variable(store, anndata_layout, group, encoding) {
+                Ok(Some(variable)) => {
+                    tree.variables.insert(group.clone(), variable);
                 }
-            };
-            let dims = anndata::axis_names(group, shape.len(), encoding_of);
-            tree.variables.insert(
-                group.clone(),
-                Variable {
-                    path: group.clone(),
-                    node: logical(group),
-                    dims,
-                    shape,
-                    chunk_shape,
-                    attrs: Default::default(),
-                    storage,
-                    in_dataframe: in_dataframe(group),
-                },
-            );
+                Ok(None) => {}
+                Err(err) if is_unsupported_array_error(err.as_ref()) => {
+                    tree.unsupported.push(group.clone());
+                }
+                Err(err) => return Err(err),
+            }
         }
         tree.register_dim_coords();
         if let Some(layout) = &layout {
@@ -319,7 +295,13 @@ impl StoreTree {
             .variables_in(node)
             .map(|v| (v.path.as_str(), &v.attrs, v.shape.as_slice()))
             .collect();
-        let (aux_coords, bounds) = cf_auxiliary_vars(&facts);
+        // CF rules do not apply to AnnData, which writes no CF attributes: an
+        // obsm entry named `spatial_bounds` with two components is data.
+        let (aux_coords, bounds) = if self.layout.is_some() {
+            Default::default()
+        } else {
+            cf_auxiliary_vars(&facts)
+        };
 
         type TableKey = (Vec<String>, Vec<u64>);
         let mut tables: HashMap<TableKey, Table> = HashMap::new();

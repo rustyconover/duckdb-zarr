@@ -152,7 +152,11 @@ pub(crate) fn catalog_rows(
         Selection::Array(requested) => {
             // One array is not a table of its node, so it gets no table name.
             let (array_name, table) = array_path_table(&store, &array_names, &requested)?;
-            rows.push(row(tree::node_of(&array_name), None, &table));
+            let node = table.variables.first().map_or_else(
+                || tree::node_of(&array_name).to_string(),
+                |var| var.node.clone(),
+            );
+            rows.push(row(&node, None, &table));
             return Ok(rows);
         }
         Selection::Node(node) => {
