@@ -40,6 +40,11 @@ SELECT * FROM read_zarr('test/fixtures/bioimage/ome_zarr/synthetic_multichannel.
 -- List a store's tables, then read one by name
 SELECT table_name, dims, data_vars FROM read_zarr_tables('test/fixtures/xarray_tutorial/multi_dim_group.zarr');
 SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/multi_dim_group.zarr', table_name := 'time_lat_lon') LIMIT 5;
+
+-- Get the statements that mount every table as a view (era5.main.surface, ...),
+-- then run them; docs/design.md, section 3, shows how from Python and the CLI
+SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
+  view_names := MAP {'time_latitude_longitude': 'surface'});
 ```
 
 See [docs/design.md](docs/design.md) for the full design and

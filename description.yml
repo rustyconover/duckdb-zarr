@@ -47,6 +47,8 @@ docs:
     - `read_zarr_metadata(path)` — inspect array names, dtypes, shapes, and roles.
     - `read_zarr_tables(path)` — list every group's tables, with the schema and table name each maps to
       (`read_zarr_groups` is the 0.1.x name).
+    - `read_zarr_views(path, 'db')` — the statements that mount every table as a view in database `db`
+      (`view_names := MAP {...}` renames them); run them to get `db.main.time_lat_lon` and so on.
 
     **Automatic path interception**
 

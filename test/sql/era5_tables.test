@@ -51,18 +51,40 @@ SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr');
 group '/' has 2 tables
 
 # ── Register them as era5.surface and era5.atmosphere ─────────────────────────
-# xarray-sql's table_names maps each dimension tuple to a name. Here each view
-# gives the catalog's name for a table the name the demo uses.
+# read_zarr_views returns the statements that mount the store, one per row.
+# view_names := MAP {...} is xarray-sql's table_names, keyed by table name.
+query TTT
+SELECT * FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
+  view_names := MAP {'time_latitude_longitude': 'surface',
+                     'time_level_latitude_longitude': 'atmosphere'});
+----
+NULL	NULL	ATTACH IF NOT EXISTS ':memory:' AS "era5";
+main	surface	CREATE OR REPLACE VIEW "era5"."main"."surface" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_latitude_longitude');
+main	atmosphere	CREATE OR REPLACE VIEW "era5"."main"."atmosphere" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_level_latitude_longitude');
+
+# The statements above, run in order as a client would.
 statement ok
-ATTACH ':memory:' AS era5;
+ATTACH IF NOT EXISTS ':memory:' AS "era5";
 
 statement ok
-CREATE VIEW era5.surface AS
-  SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_latitude_longitude');
+CREATE OR REPLACE VIEW "era5"."main"."surface" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_latitude_longitude');
 
 statement ok
-CREATE VIEW era5.atmosphere AS
-  SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_level_latitude_longitude');
+CREATE OR REPLACE VIEW "era5"."main"."atmosphere" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_level_latitude_longitude');
+
+# A misspelled table is an error, not a silently unrenamed view.
+statement error
+SELECT * FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
+  view_names := MAP {'time_lat_lon': 'surface'});
+----
+view_names names table 'time_lat_lon', which the store does not have; its tables are [time_latitude_longitude, time_level_latitude_longitude]
+
+# So is a rename onto another table's name.
+statement error
+SELECT * FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
+  view_names := MAP {'time_latitude_longitude': 'Time_Level_Latitude_Longitude'});
+----
+tables 'time_latitude_longitude' and 'time_level_latitude_longitude' would both be view 'time_level_latitude_longitude' in schema 'main'
 
 query T
 SELECT string_agg(column_name || ' ' || column_type, ', ') FROM (DESCRIBE era5.surface);

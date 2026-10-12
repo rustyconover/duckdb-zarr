@@ -126,7 +126,7 @@ Named arguments stay close to xarray's vocabulary (`variables`, `coords`, `chunk
 
 `array_path` adds an unambiguous selector for multiscale OME-Zarr levels and nested labels. The same selector is accepted by `read_zarr_metadata` and `read_zarr_tables`. A quoted `"array"` alias is also registered; the quotes are required because `ARRAY` is a DuckDB keyword. `table_name` selects a table by the name `read_zarr_tables` gives it, ignoring case like DuckDB identifiers; its quoted alias is `"table"`, because `TABLE` is a keyword too. It is the same as the table's `dims` list, which stays available, and a table whose name is `NULL` in the catalog (decision 8) can only be read by `dims`.
 
-### 3. `ATTACH` for multi-group stores
+### 3. Mounting multi-table stores: `ATTACH` and `read_zarr_views`
 
 ```sql
 ATTACH 'era5.zarr' AS era5 (TYPE ZARR);
@@ -139,7 +139,25 @@ FROM era5.atmosphere                -- (time, level, lat, lon)
 GROUP BY level;
 ```
 
-Not implemented, and not possible through the C API at DuckDB 1.5.5 (decision 8, Mounting). The same layout is available by hand: `read_zarr_tables` gives each node's tables and their names (one schema per Zarr group, the root as `main`, table names from the dimensions joined in order, like `time_lat_lon`), and the user creates the views. `era5.surface` above would be `era5.main.time_lat_lon`, renamed with `ALTER VIEW` if wanted. This is the recommended UX for ERA5-class stores where you'll be issuing many queries and want stable table names.
+Not implemented, and not possible through the C API at DuckDB 1.5.5 (decision 8, Mounting). `read_zarr_views` returns the statements that build the same layout, and the client runs them: one schema per Zarr group, the root as `main`, and one view per table, named from its dimensions joined in order (`time_lat_lon`) unless `view_names :=` renames it. This is the recommended UX for ERA5-class stores where you'll be issuing many queries and want stable table names.
+
+```sql
+SELECT sql FROM read_zarr_views('era5.zarr', 'era5',
+  view_names := MAP {'time_lat_lon': 'surface', 'time_level_lat_lon': 'atmosphere'});
+-- ATTACH IF NOT EXISTS ':memory:' AS "era5";
+-- CREATE OR REPLACE VIEW "era5"."main"."surface" AS SELECT * FROM read_zarr('era5.zarr', table_name := 'time_lat_lon');
+-- CREATE OR REPLACE VIEW "era5"."main"."atmosphere" AS SELECT * FROM read_zarr('era5.zarr', table_name := 'time_level_lat_lon');
+```
+
+`view_names` is xarray-sql's `table_names`, keyed by table name instead of dimension tuple. A table outside the root is keyed by its group path and name (`'simulation/fine/x_y'`). A key that names no table, or a rename that gives two views of one schema the same name, is an error. In Python, run each row: `for (sql,) in con.sql("SELECT sql FROM read_zarr_views(...)").fetchall(): con.execute(sql)`. In the DuckDB CLI, write the rows to a file and read it back:
+
+```
+.mode list
+.headers off
+.once mount.sql
+SELECT sql FROM read_zarr_views('era5.zarr', 'era5');
+.read mount.sql
+```
 
 ### 4. `read_zarr_metadata` and `read_zarr_tables`
 
@@ -163,7 +181,7 @@ The code, the docs and the error messages use these terms. Older sections of thi
 
 | Term | Meaning | In DuckDB | In code |
 |---|---|---|---|
-| store | A Zarr hierarchy | A database, mounted by hand (decision 8) | `ZarrStore` |
+| store | A Zarr hierarchy | A database, mounted with the statements `read_zarr_views` returns (decision 8) | `ZarrStore` |
 | node | A Zarr group, as a node of an `xarray.DataTree` | A schema; the root is `main` | a group path (`""` is the root) |
 | variable | Values over named dimensions, stored as one array | A data column | `Variable` |
 | storage | How a variable's values are stored: one array, or one that zarrs cannot open | | `Storage` |
@@ -188,6 +206,7 @@ The code, the docs and the error messages use these terms. Older sections of thi
               │  read_zarr          │
               │  read_zarr_metadata │
               │  read_zarr_tables   │
+              │  read_zarr_views    │
               │  ATTACH (TYPE ZARR) │
               │  replacement scan   │
               └──────────┬──────────┘
@@ -526,7 +545,7 @@ A Zarr store can nest groups, as an `xarray.DataTree` written with `DataTree.to_
 > - **Inherit coordinates like xarray.** A node's tables include coordinate arrays from its ancestors for dimensions the node shares with them, as `DataTree` does. As in xarray, a child whose shared dimension has a different length from its parent's is an error.
 > - **Name tables like xarray-sql.** The default name of a dimension group is `"_".join(dims)` in dimension order, or `scalar` for none (`xarray_sql.df.default_table_name`). Overrides are keyed by the dimension tuple. Two groups in one node whose names are equal after case folding get no name (`table_name` is `NULL`), because DuckDB identifiers ignore case. xarray-sql raises an error here (`xarray_sql.df.resolve_table_names`); listing the rest keeps the catalog usable, and `dims :=` still reads both groups.
 > - **Map a store to a database with one schema per node.** Store → database, node path → schema, dimension group → table. The root node is schema `main`, and a nested path is one quoted schema name: `sim."simulation/fine".x_y`. This mirrors a DataFusion `CatalogProvider` (catalog → schema → table), which is the shape xarray-sql #82 favors.
-> - **Publish the mapping through `read_zarr_tables`; let users mount it.** `read_zarr_tables` (named `read_zarr_groups` in 0.1.x) gains `group_path`, `schema_name` and `table_name` columns, so each row states the node, the schema, the dimensions and the name. That is the whole contract with xarray-sql. The extension does not create the schemas and views itself (see Mounting below). A user mounts a store with `ATTACH ':memory:' AS sim`, then one `CREATE SCHEMA` per node and one `CREATE VIEW ... AS SELECT * FROM read_zarr(store, group_path := ..., dims := [...])` per row.
+> - **Publish the mapping through `read_zarr_tables`; let users mount it.** `read_zarr_tables` (named `read_zarr_groups` in 0.1.x) gains `group_path`, `schema_name` and `table_name` columns, so each row states the node, the schema, the dimensions and the name. That is the whole contract with xarray-sql. The extension does not create the schemas and views itself (see Mounting below). `read_zarr_views(store, 'sim')` returns the statements that do: `ATTACH ':memory:' AS sim`, then one `CREATE SCHEMA` per node and one `CREATE VIEW ... AS SELECT * FROM read_zarr(store, group_path := ..., table_name := ...)` per named row.
 >
 > **Why not keep flattening:** flattening only works when no two nodes reuse a dimension name, and DataTree stores reuse them by design (multiscale levels, ensembles, AnnData's `obs` and `var` against `X`). Scoping per node is the xarray data model; matching it is what lets xarray-sql and this extension agree.
 
@@ -541,17 +560,7 @@ A Zarr store can nest groups, as an `xarray.DataTree` written with `DataTree.to_
 - The CF rules that keep auxiliary coordinates and bounds variables out of tables (`cf_auxiliary_vars` in `meta.rs`) are the same ones that give them their `role` in `read_zarr_metadata`.
 - Columns of a group read are named after the variable within its node (`foo`), as in xarray, not after its store path.
 
-The mounting recipe, generated from the catalog (`'sim.zarr'` and `sim` are the store and the alias):
-
-```sql
-ATTACH ':memory:' AS sim;
-SELECT string_agg(format(
-         'CREATE SCHEMA IF NOT EXISTS sim."{}"; CREATE VIEW sim."{}"."{}" AS SELECT * FROM read_zarr(''sim.zarr'', group_path := ''{}'', table_name := ''{}'');',
-         schema_name, schema_name, table_name, group_path, table_name), chr(10))
-FROM read_zarr_tables('sim.zarr')
-WHERE table_name IS NOT NULL;
--- then run the statements it prints
-```
+The mounting statements come from `read_zarr_views` (section 3 of the SQL surface), one per row: `ATTACH IF NOT EXISTS`, `CREATE SCHEMA IF NOT EXISTS` and `CREATE OR REPLACE VIEW`, so running them again remounts the store. It is a table function rather than a procedure for the reason below. Rows of `read_zarr_tables` with a `NULL` `table_name` get no view.
 
 **Mounting: why there is no `zarr_attach`.** A procedure such as `CALL zarr_attach('sim.zarr', 'sim')` that creates the schemas and views was spiked on 2026-09-29 (branch `spike-zarr-attach`) and rejected. The C API at DuckDB 1.5.5 has no storage-extension hook and no way to run SQL on the calling connection, so the procedure needs a second connection. The extension can get a database handle only while it loads: `get_database` returns a wrapper that DuckDB frees when loading ends (`extension_load.cpp`). So the connection must be opened at load and kept. The DDL itself worked: views mounted, a quoted `"demo/nested"` schema worked, and it ran inside `BEGIN ... COMMIT` and was visible to other connections. But the kept connection holds a strong reference to the database instance, and the function catalog that holds the connection belongs to that instance, so the instance is never freed. After `close()`, the database file stays locked against other processes, and reopening it in the same process hangs. This affects everyone who loads the extension, not only users of the procedure. A control build without the side connection released the file normally. Revisit if the C API gains storage extensions, a way to run SQL on a client context, or a callback when a database closes.
 
