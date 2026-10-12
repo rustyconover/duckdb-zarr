@@ -87,6 +87,7 @@ RAGGED_FIXTURE_VERSION = "2"
 DATATREE_FIXTURE_VERSION = "1"
 ERA5_FIXTURE_VERSION = "1"
 MANY_TABLES_FIXTURE_VERSION = "1"
+CASE_NAMES_FIXTURE_VERSION = "1"
 UNSUPPORTED_FIXTURE_VERSION = "1"
 UNREADABLE_FIXTURE_VERSION = "1"
 
@@ -928,6 +929,28 @@ def main() -> None:
                 "dimension_names": [f"d{i}"],
             }))
         mark_fixture(dest, MANY_TABLES_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── case_names (xarray.DataTree.to_zarr) ─────────────────────────────────
+    # Tests: names that DuckDB folds together. DuckDB ignores the case of ASCII
+    # letters in identifiers, so the group Main is the schema main, and its x
+    # table is the root's x view; it does not fold other letters, so the
+    # dimension Ärger names a table that ärger does not.
+    print("case_names (xarray.DataTree.to_zarr)...")
+    dest = FIXTURES / "case_names.zarr"
+    if fixture_is_current(dest, CASE_NAMES_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        if dest.exists():
+            _rmtree(dest)
+        xr.DataTree.from_dict({
+            "/": xr.Dataset(
+                {"foo": ("x", np.array([1, 2, 3], dtype="int32")),
+                 "v": ("Ärger", np.array([7, 8], dtype="int32"))},
+                coords={"x": np.array([10, 20, 30], dtype="int64")}),
+            "/Main": xr.Dataset({"bar": ("x", np.array([4, 5, 6], dtype="int32"))}),
+        }).to_zarr(dest, zarr_format=3, consolidated=False)
+        mark_fixture(dest, CASE_NAMES_FIXTURE_VERSION)
         print(f"  wrote {dest}")
 
     # ── datatree (xarray.DataTree.to_zarr) ───────────────────────────────────
