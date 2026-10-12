@@ -12,8 +12,8 @@ use crate::zarr_reader::meta::{
     select_array_name, ZarrArray, ZarrStore,
 };
 use crate::zarr_reader::types::{
-    ColumnDef, CoordArray, DimGroup, FixedValues, SharedColumnValues, StringValues, WorkUnit,
-    ZarrDtype,
+    ColumnDef, CoordArray, DimGroup, DuckDbType, FixedValues, SharedColumnValues, StringValues,
+    WorkUnit, WriteElement, ZarrDtype,
 };
 
 // ---------------------------------------------------------------------------
