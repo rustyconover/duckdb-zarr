@@ -46,6 +46,11 @@ SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_pat
 
 -- AnnData: cell annotations (cell_type is an ENUM), one row per cell named in `obs`
 SELECT cell_type, COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs') GROUP BY ALL;
+
+-- Get the statements that mount every table as a view (era5.main.surface, ...),
+-- then run them; docs/design.md, section 3, shows how from Python and the CLI
+SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
+  view_names := MAP {'time_latitude_longitude': 'surface'});
 ```
 
 See [docs/design.md](docs/design.md) for the full design,

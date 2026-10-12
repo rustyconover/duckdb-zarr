@@ -172,23 +172,33 @@ ORDER BY name;
 simulation/fine/foo	data
 simulation/fine/y	coord
 
-# ── Mounting the catalog by hand ──────────────────────────────────────────────
-# The recipe in docs/design.md, decision 8: one schema per group, one view per
-# read_zarr_tables row that has a table name.
+# ── Mounting the catalog ──────────────────────────────────────────────────────
+# read_zarr_views returns the statements of the recipe in docs/design.md,
+# decision 8: one schema per group, one view per read_zarr_tables row that has a
+# table name. A view outside the root reads its group with group_path :=.
+query TTT
+SELECT * FROM read_zarr_views('test/fixtures/xarray_tutorial/datatree.zarr', 'sim',
+  view_names := MAP {'/simulation/coarse/x_y': 'coarse'});
+----
+NULL	NULL	ATTACH IF NOT EXISTS ':memory:' AS "sim";
+main	x	CREATE OR REPLACE VIEW "sim"."main"."x" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', table_name := 'x');
+simulation/coarse	NULL	CREATE SCHEMA IF NOT EXISTS "sim"."simulation/coarse";
+simulation/coarse	coarse	CREATE OR REPLACE VIEW "sim"."simulation/coarse"."coarse" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/coarse', table_name := 'x_y');
+simulation/fine	NULL	CREATE SCHEMA IF NOT EXISTS "sim"."simulation/fine";
+simulation/fine	x_y	CREATE OR REPLACE VIEW "sim"."simulation/fine"."x_y" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine', table_name := 'x_y');
+
+# The statements a client would run, minus the coarse group's.
+statement ok
+ATTACH IF NOT EXISTS ':memory:' AS "sim";
 
 statement ok
-ATTACH ':memory:' AS sim;
+CREATE OR REPLACE VIEW "sim"."main"."x" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', table_name := 'x');
 
 statement ok
-CREATE SCHEMA sim."simulation/fine";
+CREATE SCHEMA IF NOT EXISTS "sim"."simulation/fine";
 
 statement ok
-CREATE VIEW sim."simulation/fine".x_y AS
-SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine', table_name := 'x_y');
-
-statement ok
-CREATE VIEW sim.main.x AS
-SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := '', table_name := 'x');
+CREATE OR REPLACE VIEW "sim"."simulation/fine"."x_y" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine', table_name := 'x_y');
 
 query IRR
 SELECT f.x, r.bar, SUM(f.foo)
@@ -219,3 +229,10 @@ SELECT COUNT(*), COUNT(DISTINCT table_name), MAX(table_name = 'd2099')::INT
 FROM read_zarr_tables('test/fixtures/xarray_tutorial/many_tables.zarr');
 ----
 2100	2100	1
+
+# read_zarr_views pages its statements the same way: one ATTACH, 2100 views.
+query II
+SELECT COUNT(*), COUNT(view_name)
+FROM read_zarr_views('test/fixtures/xarray_tutorial/many_tables.zarr', 'many');
+----
+2101	2100

@@ -55,6 +55,39 @@ ORDER BY group_path, table_name;
 /obsp	obs_i_obs_j	[obs_i, obs_j]	[obsp/connectivities]
 /varp	var_i_var_j	[var_i, var_j]	[varp/corr, varp/corr_csc]
 
+# read_zarr_views mounts the same tables; every view it creates reads.
+query TT
+SELECT schema_name, view_name
+FROM read_zarr_views('test/fixtures/anndata/pbmc_like.zarr', 'ad',
+  view_names := MAP {'obs_var': 'X', 'layers/obs_var': 'layers'})
+WHERE view_name IS NOT NULL;
+----
+main	obs
+main	X
+main	var
+layers	layers
+obsm	obs_X_umap_component
+obsp	obs_i_obs_j
+varp	var_i_var_j
+
+statement ok
+ATTACH IF NOT EXISTS ':memory:' AS "ad";
+
+statement ok
+CREATE OR REPLACE VIEW "ad"."main"."X" AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs_var');
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS "ad"."layers";
+
+statement ok
+CREATE OR REPLACE VIEW "ad"."layers"."layers" AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'layers', table_name := 'obs_var');
+
+# X is sparse (a row per stored entry); the layers are dense (a row per cell).
+query II
+SELECT (SELECT COUNT(*) FROM ad.X), (SELECT COUNT(*) FROM ad.layers.layers);
+----
+27	106
+
 # Columns come in the data frame's `column-order`, as in adata.obs.
 query T
 SELECT string_agg(column_name, ' ')

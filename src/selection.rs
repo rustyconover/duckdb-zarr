@@ -1,6 +1,6 @@
 //! What a table function call selects in a store (design decision 8).
 //!
-//! `read_zarr`, `read_zarr_groups` and `read_zarr_metadata` take the same two
+//! `read_zarr`, `read_zarr_tables` and `read_zarr_metadata` take the same two
 //! selectors: `array_path :=` for one array and `group_path :=` for one node
 //! (Zarr group), each with a quoted alias (`"array" :=`, `"group" :=`; `GROUP`
 //! is a DuckDB keyword, so the quotes are required). At most one may be given.

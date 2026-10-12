@@ -13,13 +13,13 @@ use crate::zarr_reader::tree::{self, StoreTree};
 use crate::zarr_reader::types::Table;
 
 #[derive(Debug, Clone)]
-struct TableRow {
-    group_path: String,
-    schema_name: String,
+pub(crate) struct TableRow {
+    pub group_path: String,
+    pub schema_name: String,
     /// `None` when `read_zarr(store, group_path := ..., dims := ...)` cannot read
     /// this row as one table, or its name collides with another table's after
     /// case folding (see [`tree::table_names`] and `check_alignment`).
-    table_name: Option<String>,
+    pub table_name: Option<String>,
     dims: Vec<String>,
     shape: Vec<u64>,
     chunk_shape: Vec<u64>,
@@ -60,60 +60,7 @@ impl VTab for ReadZarrTablesVTab {
         bind.add_result_column("coord_vars", varchar_list());
 
         let store_path = bind.get_parameter(0).to_string();
-        let fs = unsafe { extract_file_system(bind) };
-        let store = open_store(&store_path, Some(fs))?;
-        let array_names = list_array_names(&store_path, &store)?;
-        let row = |node: &str, table_name: Option<String>, table: &Table| TableRow {
-            group_path: tree::display_group(node),
-            schema_name: tree::schema_name(node),
-            table_name,
-            dims: table.dims.clone(),
-            shape: table.shape.clone(),
-            chunk_shape: table.chunk_shape.clone(),
-            data_vars: table
-                .variable_paths()
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            coord_vars: table.coords.iter().map(|(_, path)| path.clone()).collect(),
-        };
-
-        let mut rows = Vec::new();
-        let (store_tree, nodes) = match Selection::from_bind(bind)? {
-            Selection::Array(requested) => {
-                // One array is not a table of its node, so it gets no table name.
-                let (array_name, table) = array_path_table(&store, &array_names, &requested)?;
-                rows.push(row(tree::node_of(&array_name), None, &table));
-                return Ok(ReadZarrTablesBind { rows });
-            }
-            Selection::Node(node) => {
-                tree::ensure_group_exists(&store_path, &array_names, &node)?;
-                let store_tree = StoreTree::load_for_node(&store, &array_names, &node)?;
-                anndata::check_group_path(&store_path, store_tree.layout.as_ref(), &node)?;
-                (store_tree, vec![node])
-            }
-            Selection::Store => {
-                let store_tree = StoreTree::load(&store, &array_names, None)?;
-                let nodes = store_tree.nodes();
-                (store_tree, nodes)
-            }
-        };
-        for node in nodes {
-            // A row gets a table name only if read_zarr can read it as one table
-            // (its node is aligned with its ancestors, no array of another
-            // shape in the node shares its dims, zarrs can open all its arrays,
-            // and its sparse matrices, if it has only those, are all CSR or all
-            // CSC) and the name is unique in the node after case folding.
-            let node_tables = store_tree.tables(&node);
-            let aligned = node_tables.misaligned.is_none();
-            let names = tree::table_names(&node_tables.tables);
-            for (table, name) in node_tables.tables.iter().zip(names) {
-                let readable =
-                    aligned && table.unreadable().is_empty() && !table.mixes_sparse_storage();
-                rows.push(row(&node, name.filter(|_| readable), table));
-            }
-        }
-
+        let rows = catalog_rows(bind, &store_path, Selection::from_bind(bind)?)?;
         Ok(ReadZarrTablesBind { rows })
     }
 
@@ -173,4 +120,68 @@ impl VTab for ReadZarrTablesVTab {
         // node's tables are listed.
         Some(Selection::named_parameters())
     }
+}
+
+/// The rows `read_zarr_tables` lists for `selection` in the store at
+/// `store_path`, in node order.
+pub(crate) fn catalog_rows(
+    bind: &BindInfo,
+    store_path: &str,
+    selection: Selection,
+) -> Result<Vec<TableRow>, Box<dyn std::error::Error>> {
+    let fs = unsafe { extract_file_system(bind) };
+    let store = open_store(store_path, Some(fs))?;
+    let array_names = list_array_names(store_path, &store)?;
+    let row = |node: &str, table_name: Option<String>, table: &Table| TableRow {
+        group_path: tree::display_group(node),
+        schema_name: tree::schema_name(node),
+        table_name,
+        dims: table.dims.clone(),
+        shape: table.shape.clone(),
+        chunk_shape: table.chunk_shape.clone(),
+        data_vars: table
+            .variable_paths()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        coord_vars: table.coords.iter().map(|(_, path)| path.clone()).collect(),
+    };
+
+    let mut rows = Vec::new();
+    let (store_tree, nodes) = match selection {
+        Selection::Array(requested) => {
+            // One array is not a table of its node, so it gets no table name.
+            let (array_name, table) = array_path_table(&store, &array_names, &requested)?;
+            rows.push(row(tree::node_of(&array_name), None, &table));
+            return Ok(rows);
+        }
+        Selection::Node(node) => {
+            tree::ensure_group_exists(store_path, &array_names, &node)?;
+            let store_tree = StoreTree::load_for_node(&store, &array_names, &node)?;
+            anndata::check_group_path(store_path, store_tree.layout.as_ref(), &node)?;
+            (store_tree, vec![node])
+        }
+        Selection::Store => {
+            let store_tree = StoreTree::load(&store, &array_names, None)?;
+            let nodes = store_tree.nodes();
+            (store_tree, nodes)
+        }
+    };
+    for node in nodes {
+        // A row gets a table name only if read_zarr can read it as one table
+        // (its node is aligned with its ancestors, no array of another
+        // shape in the node shares its dims, zarrs can open all its arrays,
+        // and its sparse matrices, if it has only those, are all CSR or all
+        // CSC) and the name is unique in the node after case folding.
+        let node_tables = store_tree.tables(&node);
+        let aligned = node_tables.misaligned.is_none();
+        let names = tree::table_names(&node_tables.tables);
+        for (table, name) in node_tables.tables.iter().zip(names) {
+            let readable =
+                aligned && table.unreadable().is_empty() && !table.mixes_sparse_storage();
+            rows.push(row(&node, name.filter(|_| readable), table));
+        }
+    }
+
+    Ok(rows)
 }

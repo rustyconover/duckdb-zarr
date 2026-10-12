@@ -111,29 +111,55 @@ DuckDB, so the quotes are necessary.
 ## Mount the store as a database
 
 Views give each table a stable name, so queries do not repeat `read_zarr`.
-Attach an in-memory database, then create one schema for each group and one
-view for each table. The names come from `read_zarr_tables`.
+`read_zarr_views` returns the SQL statements that mount the store, one
+statement in each row. Run the statements in order. They attach an in-memory
+database, create one schema for each group, and create one view for each table.
 
 ```sql
-ATTACH ':memory:' AS pbmc;
-CREATE VIEW pbmc.main.obs AS
-  SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', table_name := 'obs');
-CREATE VIEW pbmc.main.var AS
-  SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', table_name := 'var');
-CREATE VIEW pbmc.main.obs_var AS
-  SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', table_name := 'obs_var');
-CREATE SCHEMA pbmc.layers;
-CREATE VIEW pbmc.layers.obs_var AS
-  SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'layers', table_name := 'obs_var');
+SELECT sql FROM read_zarr_views('test/fixtures/anndata/pbmc_like.zarr', 'pbmc');
+```
+
+```
+ATTACH IF NOT EXISTS ':memory:' AS "pbmc";
+CREATE OR REPLACE VIEW "pbmc"."main"."obs" AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs');
+CREATE OR REPLACE VIEW "pbmc"."main"."obs_var" AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs_var');
+CREATE OR REPLACE VIEW "pbmc"."main"."var" AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'var');
+CREATE SCHEMA IF NOT EXISTS "pbmc"."layers";
+CREATE OR REPLACE VIEW "pbmc"."layers"."obs_var" AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'layers', table_name := 'obs_var');
+...
+```
+
+In Python, run each row:
+
+```python
+for (sql,) in con.sql("SELECT sql FROM read_zarr_views('pbmc_like.zarr', 'pbmc')").fetchall():
+    con.execute(sql)
+```
+
+In the DuckDB CLI, write the rows to a file, then read the file:
+
+```
+.mode list
+.headers off
+.once mount.sql
+SELECT sql FROM read_zarr_views('pbmc_like.zarr', 'pbmc');
+.read mount.sql
 ```
 
 A table in `main` needs no schema name: `pbmc.obs` is `pbmc.main.obs`. The
 examples in the rest of this page use these views.
 
+To give a view a different name, use `view_names :=`. A key is a table name
+from `read_zarr_tables`. For a table that is not in the root group, the key
+starts with the group path:
+
+```sql
+SELECT sql FROM read_zarr_views('pbmc_like.zarr', 'pbmc',
+  view_names := MAP {'obs_var': 'X', 'layers/obs_var': 'layers'});
+```
+
 The views read the store again for each query. If you run many queries,
 `CREATE TABLE ... AS SELECT` copies the data into DuckDB once.
-[docs/design.md](design.md), decision 8, has a query that writes the
-statements for every row of `read_zarr_tables`.
 
 ## Sparse matrices omit zeros
 
