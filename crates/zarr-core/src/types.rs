@@ -1,0 +1,228 @@
+use std::sync::Arc;
+
+use crate::cftime::CfTimeEncoding;
+
+/// On-disk Zarr numeric dtype as reported by zarrs `DataType::to_string()`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ZarrDtype {
+    Bool,
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Float32,
+    Float64,
+    String,
+}
+
+impl ZarrDtype {
+    // Returns Option, not FromStr's Result; kept as-is from the extension.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "bool" => Some(Self::Bool),
+            "int8" => Some(Self::Int8),
+            "int16" => Some(Self::Int16),
+            "int32" => Some(Self::Int32),
+            "int64" => Some(Self::Int64),
+            "uint8" => Some(Self::UInt8),
+            "uint16" => Some(Self::UInt16),
+            "uint32" => Some(Self::UInt32),
+            "uint64" => Some(Self::UInt64),
+            "float32" | "float" => Some(Self::Float32),
+            "float64" | "double" => Some(Self::Float64),
+            "string" => Some(Self::String),
+            _ => None,
+        }
+    }
+
+    pub fn is_integer(&self) -> bool {
+        matches!(
+            self,
+            Self::Int8
+                | Self::Int16
+                | Self::Int32
+                | Self::Int64
+                | Self::UInt8
+                | Self::UInt16
+                | Self::UInt32
+                | Self::UInt64
+        )
+    }
+
+    pub fn is_unsigned(&self) -> bool {
+        matches!(
+            self,
+            Self::UInt8 | Self::UInt16 | Self::UInt32 | Self::UInt64
+        )
+    }
+
+    /// `None` for [`Self::String`], which is variable-length and has no fixed byte size.
+    pub fn byte_size(&self) -> Option<usize> {
+        match self {
+            Self::Bool | Self::Int8 | Self::UInt8 => Some(1),
+            Self::Int16 | Self::UInt16 => Some(2),
+            Self::Int32 | Self::UInt32 | Self::Float32 => Some(4),
+            Self::Int64 | Self::UInt64 | Self::Float64 => Some(8),
+            Self::String => None,
+        }
+    }
+}
+
+/// How an on-disk array column is decoded into output values.
+#[derive(Debug, Clone)]
+pub enum ColumnEncoding {
+    Plain,
+    PackedInt {
+        scale_factor: f64,
+        add_offset: f64,
+    },
+    /// CF-encoded time (`units = "<step> since <reference>"`) → `TIMESTAMP`.
+    CfTime(CfTimeEncoding),
+}
+
+/// Parsed NULL-masking sentinel from CF attrs (`_FillValue` or `missing_value`).
+#[derive(Debug, Clone)]
+pub enum FillSentinel {
+    /// Covers float32/float64 on-disk types. `f64::NAN` means check `is_nan()`.
+    Float(f64),
+    /// Covers signed integer on-disk types.
+    Int(i64),
+    /// Covers unsigned integer on-disk types.
+    UInt(u64),
+}
+
+/// Describes one output column (either a dim coord or a data variable).
+#[derive(Debug, Clone)]
+pub struct ColumnDef {
+    pub name: String,
+    pub on_disk_dtype: ZarrDtype,
+    pub encoding: ColumnEncoding,
+    pub sentinel: Option<FillSentinel>,
+    pub is_coord: bool,
+    /// For coord columns: the dimension index this coord maps to in group.dims.
+    /// None for data variable columns.
+    pub dim_idx: Option<usize>,
+}
+
+/// One dim group: arrays sharing an identical ordered dimension set.
+#[derive(Debug)]
+pub struct DimGroup {
+    pub dims: Vec<String>,
+    pub shape: Vec<u64>,
+    pub chunk_shape: Vec<u64>,
+    pub data_var_names: Vec<String>,
+    pub coord_var_names: Vec<String>,
+}
+
+/// Decoded element values for one array segment (strategy interface).
+///
+/// Each implementation owns its in-memory representation and knows how to
+/// write one element into a DuckDB output vector, so callers never branch on
+/// the dtype family.
+/// Decoded values of one array chunk (or a whole coordinate array).
+///
+/// Engine adapters write elements out by downcasting with [`Self::as_fixed`] /
+/// [`Self::as_strings`]; the core only needs [`Self::key_at`] (pruning).
+pub trait ColumnValues: std::fmt::Debug + Send + Sync {
+    /// Comparable numeric value of element `idx` after CF decoding (TIMESTAMPs are
+    /// microseconds since the epoch). `None` for NULL elements and for dtypes with
+    /// no numeric order (strings), which therefore never match a range bound.
+    fn key_at(&self, _idx: usize) -> Option<f64> {
+        None
+    }
+
+    fn as_fixed(&self) -> Option<&FixedValues> {
+        None
+    }
+
+    fn as_strings(&self) -> Option<&StringValues> {
+        None
+    }
+}
+
+/// Shared handle to decoded values; cheap to clone.
+pub type SharedColumnValues = Arc<dyn ColumnValues>;
+
+/// Fixed-width dtypes: one contiguous native-endian byte buffer plus the
+/// bind-time decoding (CF packing / time, fill sentinel) applied per element.
+#[derive(Debug)]
+pub struct FixedValues {
+    /// Row-major native-endian bytes, length = `n * dtype.byte_size()`.
+    pub bytes: Vec<u8>,
+    pub dtype: ZarrDtype,
+    pub encoding: ColumnEncoding,
+    pub sentinel: Option<FillSentinel>,
+    elem_size: usize,
+}
+
+impl FixedValues {
+    /// Returns `None` if `dtype` is not fixed-width.
+    pub fn new(
+        bytes: Vec<u8>,
+        dtype: ZarrDtype,
+        encoding: ColumnEncoding,
+        sentinel: Option<FillSentinel>,
+    ) -> Option<Self> {
+        let elem_size = dtype.byte_size()?;
+        Some(Self {
+            bytes,
+            dtype,
+            encoding,
+            sentinel,
+            elem_size,
+        })
+    }
+
+    pub fn elem_size(&self) -> usize {
+        self.elem_size
+    }
+}
+
+impl ColumnValues for FixedValues {
+    fn key_at(&self, idx: usize) -> Option<f64> {
+        crate::decode::element_key(
+            &self.bytes,
+            &self.dtype,
+            &self.encoding,
+            &self.sentinel,
+            idx,
+            self.elem_size,
+        )
+    }
+
+    fn as_fixed(&self) -> Option<&FixedValues> {
+        Some(self)
+    }
+}
+
+/// Variable-length UTF-8 strings: one decoded `String` per element.
+#[derive(Debug)]
+pub struct StringValues {
+    pub strings: Vec<String>,
+}
+
+impl ColumnValues for StringValues {
+    fn as_strings(&self) -> Option<&StringValues> {
+        Some(self)
+    }
+}
+
+/// A pre-loaded coordinate array (shape is 1-D: `[n]`).
+#[derive(Debug, Clone)]
+pub struct CoordArray {
+    pub dtype: ZarrDtype,
+    pub encoding: ColumnEncoding,
+    pub sentinel: Option<FillSentinel>,
+    pub data: SharedColumnValues,
+}
+
+/// One unit of parallel work: a chunk index tuple for all data variables.
+#[derive(Debug, Clone)]
+pub struct WorkUnit {
+    pub chunk_indices: Vec<u64>,
+}

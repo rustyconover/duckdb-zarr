@@ -11,7 +11,7 @@
 
 use chrono::NaiveDate;
 
-use super::types::{ColumnEncoding, CoordArray};
+use crate::types::{ColumnEncoding, CoordArray};
 
 /// One parsed `[dim, lo, hi]` entry. `None` means unbounded on that side.
 #[derive(Debug, Clone, PartialEq)]
@@ -114,7 +114,7 @@ pub fn chunks_with_kept(mask: &[bool], shape: u64, chunk_size: u64) -> Vec<u64> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zarr_reader::types::{FixedValues, ZarrDtype};
+    use crate::types::{FixedValues, ZarrDtype};
     use std::sync::Arc;
 
     fn f64_coord(values: &[f64]) -> CoordArray {
