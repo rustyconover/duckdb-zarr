@@ -107,19 +107,21 @@ impl VTab for ReadZarrMetaVTab {
                 Err(err) => return Err(err),
             }
         }
+        // As in StoreTree::tables, CF rules do not apply to AnnData objects.
+        let in_anndata = |name: &str| {
+            layout
+                .as_ref()
+                .is_some_and(|l| l.object_of(tree::node_of(name)).is_some())
+        };
         let facts: Vec<ArrayFacts> = opened
             .iter()
+            .filter(|(name, _)| !in_anndata(name))
             .filter_map(|(name, arr)| {
                 let arr = arr.as_ref().ok()?;
                 Some((name.as_str(), arr.attributes(), arr.shape()))
             })
             .collect();
-        // As in StoreTree::tables, CF rules do not apply to AnnData.
-        let (aux_coords, bounds_vars) = if layout.is_some() {
-            Default::default()
-        } else {
-            cf_auxiliary_vars(&facts)
-        };
+        let (aux_coords, bounds_vars) = cf_auxiliary_vars(&facts);
 
         let mut rows = Vec::new();
         for &(name, ref arr) in &opened {

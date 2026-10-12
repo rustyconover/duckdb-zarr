@@ -91,6 +91,7 @@ DATATREE_FIXTURE_VERSION = "1"
 ERA5_FIXTURE_VERSION = "1"
 MANY_TABLES_FIXTURE_VERSION = "1"
 CASE_NAMES_FIXTURE_VERSION = "1"
+SPATIALDATA_FIXTURE_VERSION = "1"
 UNSUPPORTED_FIXTURE_VERSION = "1"
 UNREADABLE_FIXTURE_VERSION = "1"
 
@@ -955,6 +956,80 @@ def main() -> None:
         rechunked.attrs.update(d_attrs)
         zarr.consolidate_metadata(str(dest))
         mark_fixture(dest, AXIS_NAMED_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── anndata/spatialdata_like (real anndata writer) ───────────────────────
+    # Tests (test/sql/spatialdata.test) for AnnData objects inside a store, laid
+    # out as SpatialData writes them (spatialdata 0.8, its blobs() dataset):
+    #   * labels/cells, a label image (OME-Zarr, one scale s0) whose pixels hold
+    #     instance ids: 1 covers 3 pixels, 2 covers 4 and 3 covers 2;
+    #   * tables/cells, an AnnData table that annotates those labels, with the
+    #     attributes that name its region and instance key; obsm/spatial gives
+    #     it a second node;
+    #   * tables/spots, a second AnnData table with other cells and genes;
+    #   * points/transcripts, a points element. SpatialData stores points and
+    #     shapes as Parquet beside the Zarr groups; a placeholder file stands in
+    #     for it, which the reader must skip.
+    print("anndata/spatialdata_like (real anndata writer)...")
+    dest = ANNDATA_FIXTURES / "spatialdata_like.zarr"
+    if fixture_is_current(dest, SPATIALDATA_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        import anndata as ad
+        import pandas as pd
+        if dest.exists():
+            _rmtree(dest)
+        root = zarr.open_group(str(dest), mode="w", zarr_format=3)
+        root.attrs["spatialdata_attrs"] = {"version": "0.2"}
+
+        labels = root.create_group("labels").create_group("cells")
+        labels.attrs.update({
+            "multiscales": [{
+                "version": "0.4",
+                "name": "cells",
+                "axes": [{"name": "y", "type": "space"}, {"name": "x", "type": "space"}],
+                "datasets": [{"path": "s0", "coordinateTransformations": [
+                    {"type": "scale", "scale": [1.0, 1.0]}]}],
+            }],
+            "image-label": {"version": "0.4"},
+        })
+        pixels = np.array([[0, 1, 1, 2], [0, 1, 2, 2], [3, 3, 0, 2]], dtype="uint16")
+        s0 = labels.create_array("s0", shape=pixels.shape, chunks=pixels.shape,
+                                 dtype=pixels.dtype, dimension_names=["y", "x"])
+        s0[:] = pixels
+
+        tables = root.create_group("tables")
+        cells = ad.AnnData(
+            X=np.array([[1, 0], [0, 2], [3, 0]], dtype=np.float32),
+            obs=pd.DataFrame({
+                "instance_id": np.array([1, 2, 3], dtype=np.int64),
+                "region": pd.Categorical(["cells"] * 3),
+            }, index=["c1", "c2", "c3"]),
+            var=pd.DataFrame(index=["g0", "g1"]),
+            obsm={"spatial": np.array([[1.5, 0.5], [2.5, 1.0], [0.5, 2.0]])},
+        )
+        spots = ad.AnnData(
+            X=np.array([[5], [6]], dtype=np.float32),
+            obs=pd.DataFrame(index=["s1", "s2"]),
+            var=pd.DataFrame(index=["g9"]),
+        )
+        with ad.settings.override(zarr_write_format=3):
+            ad.io.write_elem(tables, "cells", cells)
+            ad.io.write_elem(tables, "spots", spots)
+        tables["cells"].attrs.update({
+            "spatialdata-encoding-type": "ngff:regions_table",
+            "region": "cells",
+            "region_key": "region",
+            "instance_key": "instance_id",
+        })
+
+        points = root.create_group("points").create_group("transcripts")
+        points.attrs.update({"encoding-type": "ngff:points", "axes": ["x", "y"]})
+        parquet = dest / "points" / "transcripts" / "points.parquet"
+        parquet.mkdir()
+        (parquet / "part.0.parquet").write_bytes(b"not Zarr")
+        zarr.consolidate_metadata(str(dest))
+        mark_fixture(dest, SPATIALDATA_FIXTURE_VERSION)
         print(f"  wrote {dest}")
 
     # ── unsupported_dtype (hand-written metadata) ────────────────────────────

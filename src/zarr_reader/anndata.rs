@@ -1,5 +1,10 @@
 //! AnnData stores read as an xarray `DataTree` (design decision 9).
 //!
+//! An AnnData object is a group with `encoding-type: anndata`: the root of an
+//! AnnData store, or a group inside another store, such as a SpatialData
+//! table at `tables/<name>`. Its elements are found by their paths relative to
+//! that group. Groups outside every AnnData object read as plain Zarr.
+//!
 //! AnnData writes no dimension names, and stores some variables as a group of
 //! arrays: a categorical is `codes` plus `categories`, a nullable column is
 //! `values` plus `mask`, and a sparse matrix is `data`, `indices` and `indptr`
@@ -57,10 +62,12 @@ pub fn read_encoding_type(store: &ZarrStore, path: &str) -> Option<String> {
     attr_str(&read_group_attrs(store, path)?, "encoding-type")
 }
 
-/// The groups of an AnnData store that matter for reading it.
+/// The groups of a store's AnnData objects that matter for reading them.
 #[derive(Debug, Default)]
 pub struct Layout {
-    /// The `encoding-type` of each group, keyed by path (`""` is the root).
+    /// The `encoding-type` of each AnnData object's group and of the groups
+    /// inside it, keyed by path (`""` is the root). Groups outside every
+    /// AnnData object are not listed.
     pub encodings: HashMap<String, String>,
     /// For each `dataframe` group, the name of its index column (its `_index`
     /// attribute; usually `_index`).
@@ -76,6 +83,23 @@ pub struct Layout {
 impl Layout {
     pub fn encoding_of(&self, group: &str) -> Option<String> {
         self.encodings.get(group).cloned()
+    }
+
+    /// The AnnData object that `node` is, or lies in: the nearest group at or
+    /// above it with `encoding-type: anndata`. `None` outside every AnnData
+    /// object.
+    pub fn object_of(&self, node: &str) -> Option<String> {
+        object_of(node, |g| self.encoding_of(g))
+    }
+
+    /// Whether `path` is in an AnnData object's `uns`, its unstructured
+    /// metadata. It has no axes, so none of it is read as tables, and it is
+    /// never opened during enumeration: it often holds arrays zarrs cannot
+    /// open (record arrays, awkward arrays). `array_path=` still reads its
+    /// arrays.
+    pub fn is_unstructured(&self, path: &str) -> bool {
+        self.object_of(node_of(path))
+            .is_some_and(|object| is_unstructured(relative(path, &object)))
     }
 
     /// Where a variable sorts among the columns of its table: by its data
@@ -155,7 +179,11 @@ pub fn check_group_path(
     if parent == node {
         return Ok(());
     }
-    let axis = if node == "raw/var" { RAW_VAR } else { node };
+    let axis = if basename(node) == VAR && basename(&parent) == "raw" {
+        RAW_VAR
+    } else {
+        basename(node)
+    };
     Err(format!(
         "'{store_path}': in an AnnData store, the columns of '{}' are in the group '{}': \
          read_zarr('{store_path}', group_path := '{parent}', table_name := '{axis}')",
@@ -165,19 +193,32 @@ pub fn check_group_path(
     .into())
 }
 
-/// The layout of an AnnData store, or `None` for a store whose root is not an
-/// AnnData object, so that other stores pay for no extra metadata reads.
+/// The layout of a store's AnnData objects, or `None` for a store that has
+/// none. A store whose root is an AnnData object costs one metadata read more
+/// than another store; otherwise each group that holds arrays is read once to
+/// find AnnData objects inside the store (a SpatialData table), and the groups
+/// inside each object once more.
 pub fn layout(store: &ZarrStore, array_names: &[String]) -> Option<Layout> {
-    if read_encoding_type(store, "")?.as_str() != "anndata" {
+    let objects = find_objects(store, array_names);
+    if objects.is_empty() {
         return None;
     }
     let mut layout = Layout::default();
-    layout
-        .encodings
-        .insert(String::new(), "anndata".to_string());
-    for name in array_names.iter().filter(|name| !is_unstructured(name)) {
+    for object in objects {
+        layout.encodings.insert(object, "anndata".to_string());
+    }
+    for name in array_names {
+        let Some(object) = layout.object_of(node_of(name)) else {
+            continue;
+        };
+        if layout.is_unstructured(name) {
+            continue;
+        }
         for group in self_and_ancestors(node_of(name)) {
-            if group.is_empty() || layout.encodings.contains_key(&group) {
+            if group == object {
+                break;
+            }
+            if layout.encodings.contains_key(&group) {
                 continue;
             }
             let attrs = read_group_attrs(store, &group).unwrap_or_default();
@@ -207,14 +248,66 @@ pub fn layout(store: &ZarrStore, array_names: &[String]) -> Option<Layout> {
     Some(layout)
 }
 
-/// The node an element in `physical_node` belongs to. The columns of the
-/// `obs` and `var` data frames belong to the root, beside `X`, and those of
-/// `raw/var` to `raw`, beside `raw/X`. These data frames annotate the axes of
-/// the matrix next to them; as nodes of their own they would give tables named
-/// `obs.obs` and `var.var`. Every other group is its own node.
+/// The groups with `encoding-type: anndata` that hold arrays: the root alone
+/// if it is one, else the outermost such groups. Groups inside an AnnData
+/// object are not searched, so its `uns` is never read.
+fn find_objects(store: &ZarrStore, array_names: &[String]) -> Vec<String> {
+    let is_object = |group: &str| read_encoding_type(store, group).as_deref() == Some("anndata");
+    if is_object("") {
+        return vec![String::new()];
+    }
+    let mut groups: Vec<String> = array_names
+        .iter()
+        .flat_map(|name| self_and_ancestors(node_of(name)))
+        .filter(|group| !group.is_empty())
+        .collect();
+    // Parents before children, so that an object's groups are skipped.
+    groups.sort_by_key(|group| (group.matches('/').count(), group.clone()));
+    groups.dedup();
+    let mut objects: Vec<String> = Vec::new();
+    for group in groups {
+        let inside = objects
+            .iter()
+            .any(|object| group.starts_with(&format!("{object}/")));
+        if !inside && is_object(&group) {
+            objects.push(group);
+        }
+    }
+    objects
+}
+
+/// The AnnData object that `node` is, or lies in: the nearest group at or
+/// above it whose `encoding-type` (from `encoding_of`) is `anndata`.
+pub fn object_of(node: &str, encoding_of: impl Fn(&str) -> Option<String>) -> Option<String> {
+    self_and_ancestors(node)
+        .into_iter()
+        .find(|group| encoding_of(group).as_deref() == Some("anndata"))
+}
+
+/// `path` relative to the group `object` that contains it: `tables/t/obs` in
+/// `tables/t` is `obs`, and the object itself is `""`.
+fn relative<'a>(path: &'a str, object: &str) -> &'a str {
+    if object.is_empty() {
+        return path;
+    }
+    match path.strip_prefix(object) {
+        Some("") => "",
+        Some(rest) => rest.strip_prefix('/').unwrap_or(path),
+        None => path,
+    }
+}
+
+/// The node an element in `physical_node` belongs to. The columns of an
+/// AnnData object's `obs` and `var` data frames belong to the object's own
+/// node, beside `X`, and those of `raw/var` to `raw`, beside `raw/X`. These
+/// data frames annotate the axes of the matrix next to them; as nodes of their
+/// own they would give tables named `obs.obs` and `var.var`. Every other group
+/// is its own node.
 pub fn logical_node(physical_node: &str, encoding_of: impl Fn(&str) -> Option<String>) -> String {
-    let folded = matches!(physical_node, "obs" | "var" | "raw/var")
-        && encoding_of(physical_node).as_deref() == Some("dataframe");
+    let in_object = object_of(node_of(physical_node), &encoding_of).is_some_and(|object| {
+        matches!(relative(physical_node, &object), "obs" | "var" | "raw/var")
+    });
+    let folded = in_object && encoding_of(physical_node).as_deref() == Some("dataframe");
     if folded {
         node_of(physical_node).to_string()
     } else {
@@ -233,11 +326,9 @@ pub const VAR_J: &str = "var_j";
 pub const COORDINATE_ALIASES: &[(&str, &str)] =
     &[(OBS_I, OBS), (OBS_J, OBS), (VAR_I, VAR), (VAR_J, VAR)];
 
-/// Whether `path` is in `uns`, AnnData's unstructured metadata. It has no axes,
-/// so none of it is read as tables, and it is never opened during
-/// enumeration: it often holds arrays zarrs cannot open (record arrays,
-/// awkward arrays). `array_path=` still reads its arrays.
-pub fn is_unstructured(path: &str) -> bool {
+/// Whether `path`, relative to its AnnData object, is in `uns` (see
+/// [`Layout::is_unstructured`]).
+fn is_unstructured(path: &str) -> bool {
     path == "uns" || path.starts_with("uns/")
 }
 
@@ -351,8 +442,10 @@ pub fn variable_table(
 
 /// Dimension names for the AnnData element at `path` with `ndim` dimensions,
 /// or `None` if the element has no fixed axes (`uns`, anything inside an
-/// encoded group, or a store that is not AnnData). `encoding_of` gives a
-/// group's `encoding-type`.
+/// encoded group, or an array outside every AnnData object). `encoding_of`
+/// gives a group's `encoding-type`. Element paths are relative to the
+/// AnnData object's group: in a SpatialData table at `tables/t`, `X` is
+/// `tables/t/X`.
 ///
 /// | Element | Dimensions |
 /// |---|---|
@@ -371,21 +464,24 @@ pub fn axis_names(
     ndim: usize,
     encoding_of: impl Fn(&str) -> Option<String>,
 ) -> Option<Vec<String>> {
-    let is = |group: &str, encoding: &str| encoding_of(group).as_deref() == Some(encoding);
-    if !is("", "anndata") {
-        return None;
-    }
-    // Every group between the root and the element must be a container. This
-    // rules out the arrays inside an encoded variable and unknown encodings
-    // such as awkward arrays.
     let node = node_of(path);
+    let object = object_of(node, &encoding_of)?;
+    // Every group between the object and the element must be a container.
+    // This rules out the arrays inside an encoded variable and unknown
+    // encodings such as awkward arrays.
     for group in self_and_ancestors(node) {
-        if !group.is_empty()
-            && !encoding_of(&group).is_some_and(|e| CONTAINER_ENCODINGS.contains(&e.as_str()))
-        {
+        if group == object {
+            break;
+        }
+        if !encoding_of(&group).is_some_and(|e| CONTAINER_ENCODINGS.contains(&e.as_str())) {
             return None;
         }
     }
+    // Groups named relative to the object.
+    let is = |group: &str, encoding: &str| {
+        encoding_of(&join(&object, group)).as_deref() == Some(encoding)
+    };
+    let node = relative(node, &object);
 
     let name = basename(path);
     // An obsm/varm entry's other axes are its components: `X_umap` is
@@ -490,5 +586,38 @@ mod tests {
 
         // Not an AnnData store.
         assert_eq!(axis_names("X", 2, groups(&[])), None);
+    }
+
+    #[test]
+    fn an_anndata_object_inside_a_store_reads_like_one_at_the_root() {
+        // A SpatialData table: the AnnData object is the group tables/t.
+        let enc = groups(&[
+            ("tables/t", "anndata"),
+            ("tables/t/obs", "dataframe"),
+            ("tables/t/obsm", "dict"),
+            ("tables/t/raw", "raw"),
+            ("tables/t/raw/var", "dataframe"),
+        ]);
+        let names = |path: &str, ndim: usize| axis_names(path, ndim, &enc);
+        assert_eq!(names("tables/t/X", 2).unwrap(), ["obs", "var"]);
+        assert_eq!(names("tables/t/obs/region", 1).unwrap(), ["obs"]);
+        assert_eq!(
+            names("tables/t/obsm/spatial", 2).unwrap(),
+            ["obs", "spatial_component"]
+        );
+        assert_eq!(names("tables/t/raw/X", 2).unwrap(), ["obs", "raw_var"]);
+        // Outside the object, nothing is AnnData.
+        assert_eq!(names("tables/X", 2), None);
+        assert_eq!(names("X", 2), None);
+        assert_eq!(names("labels/obs/x", 1), None);
+
+        assert_eq!(logical_node("tables/t/obs", &enc), "tables/t");
+        assert_eq!(logical_node("tables/t/raw/var", &enc), "tables/t/raw");
+        assert_eq!(logical_node("tables/t/obsm", &enc), "tables/t/obsm");
+        assert_eq!(logical_node("tables/t", &enc), "tables/t");
+
+        assert_eq!(relative("tables/t/obs", "tables/t"), "obs");
+        assert_eq!(relative("tables/t", "tables/t"), "");
+        assert_eq!(relative("obs", ""), "obs");
     }
 }

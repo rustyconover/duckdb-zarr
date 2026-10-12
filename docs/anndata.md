@@ -273,12 +273,71 @@ stored entries of a sparse `X` as `obs`, `var` and `value`, and
 `group_path :=` cannot name an encoded column, because it is not a group of
 tables.
 
+## SpatialData stores
+
+A [SpatialData](https://spatialdata.scverse.org/) store keeps each table as an
+AnnData object at `tables/<name>`. The extension reads any group with
+`encoding-type: anndata` as an AnnData object, so each table is a schema of its
+own: `tables/cells` has the tables `obs`, `var` and `obs_var`, and
+`tables/cells/obsm` has the embeddings, with the cell names of `tables/cells`.
+
+The other elements of a SpatialData store are not AnnData:
+
+| Element | Format | Read it with |
+|---|---|---|
+| `images/<name>`, `labels/<name>` | OME-Zarr | `read_zarr`. Read one scale with `array_path := 'labels/<name>/s0'`. |
+| `points/<name>` | Parquet files in `points.parquet/` | `read_parquet('store.zarr/points/<name>/points.parquet/*.parquet')` |
+| `shapes/<name>` | GeoParquet file `shapes.parquet` | `read_parquet('store.zarr/shapes/<name>/shapes.parquet')`. The `geometry` column is a DuckDB `GEOMETRY`. |
+| `tables/<name>` | AnnData | `read_zarr` with `group_path := 'tables/<name>'` |
+
+A table's attributes name the element it annotates (`region`), the `obs`
+column that holds that element's name (`region_key`), and the `obs` column
+that holds the instance id (`instance_key`). Join the table to the element on
+the instance id:
+
+- In a label image, the pixel value is the instance id.
+- In points, the instance id is a column, usually `instance_id`.
+- In shapes, the instance id is the row's index. GeoPandas does not write a
+  default index (0, 1, 2, ...), so use the row number:
+  `read_parquet(..., file_row_number := true)` adds it as `file_row_number`.
+
+The example store `test/fixtures/anndata/spatialdata_like.zarr` has a label
+image `labels/cells` and a table `tables/cells` that annotates it. This query
+gives the area in pixels of each cell:
+
+```sql
+SELECT o.instance_id, o.region, COUNT(*) AS area_px
+FROM read_zarr('test/fixtures/anndata/spatialdata_like.zarr',
+  array_path := 'labels/cells/s0') AS l
+JOIN read_zarr('test/fixtures/anndata/spatialdata_like.zarr',
+  group_path := 'tables/cells', table_name := 'obs') AS o
+  ON l.value = o.instance_id
+GROUP BY ALL
+ORDER BY area_px DESC;
+```
+
+```text
+┌─────────────┬────────┬─────────┐
+│ instance_id │ region │ area_px │
+├─────────────┼────────┼─────────┤
+│           2 │ cells  │       4 │
+│           1 │ cells  │       3 │
+│           3 │ cells  │       2 │
+└─────────────┴────────┴─────────┘
+```
+
+`read_zarr_views` mounts the tables and labels of a SpatialData store, for
+example as `sd."tables/cells".obs`. It does not mount points or shapes,
+because they are not Zarr. Create views for them with `read_parquet`.
+
 ## Limits
 
-- The extension uses this layout only when the root group has
+- The extension uses this layout only in groups with
   `encoding-type: anndata`. An old store that has no `encoding-type`
   attributes reads only with `array_path :=`.
-- The extension does not read `uns`, awkward arrays, or MuData stores.
+- The extension does not read `uns` or awkward arrays. In a MuData store, the
+  modalities (`mod/<name>`) read as AnnData objects, but the global `obs` and
+  `var` do not.
 - Sparse matrices with the same dimensions and no dense array beside them
   share a table only if all are CSR or all are CSC. A table that mixes the two
   has no `table_name` in `read_zarr_tables`; read each matrix with

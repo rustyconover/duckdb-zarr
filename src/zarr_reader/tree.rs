@@ -25,8 +25,8 @@ pub struct StoreTree {
     /// dimension) is registered in its node; so is an AnnData data frame's
     /// index, under its axis (`obs`, `var`).
     pub coords: HashMap<(String, String), (String, u64)>,
-    /// The AnnData layout, for a store whose root is an AnnData object
-    /// (decision 9); `None` for other stores.
+    /// The layout of the store's AnnData objects (decision 9); `None` for a
+    /// store that has none.
     pub layout: Option<anndata::Layout>,
     /// Arrays zarrs cannot open and whose metadata document cannot be read
     /// either. They are left out of every table; `read_zarr_metadata` lists
@@ -110,9 +110,9 @@ impl StoreTree {
         array_names: &[String],
         nodes: Option<&HashSet<String>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // In an AnnData store, name each element's axes and read encoded
+        // In an AnnData object, name each element's axes and read encoded
         // groups (categoricals, nullable columns, sparse matrices) as one
-        // variable each (decision 9). Other stores skip this entirely.
+        // variable each (decision 9). Stores without one skip this entirely.
         let layout = anndata::layout(store, array_names);
         let encoding_of = |group: &str| layout.as_ref().and_then(|l| l.encoding_of(group));
         // Without an AnnData layout, an element belongs to the group that holds
@@ -134,7 +134,7 @@ impl StoreTree {
         for name in array_names {
             if !wanted(name)
                 || inside_variable(name)
-                || (layout.is_some() && anndata::is_unstructured(name))
+                || layout.as_ref().is_some_and(|l| l.is_unstructured(name))
             {
                 continue;
             }
@@ -297,7 +297,11 @@ impl StoreTree {
             .collect();
         // CF rules do not apply to AnnData, which writes no CF attributes: an
         // obsm entry named `spatial_bounds` with two components is data.
-        let (aux_coords, bounds) = if self.layout.is_some() {
+        let in_anndata = self
+            .layout
+            .as_ref()
+            .is_some_and(|l| l.object_of(node).is_some());
+        let (aux_coords, bounds) = if in_anndata {
             Default::default()
         } else {
             cf_auxiliary_vars(&facts)
