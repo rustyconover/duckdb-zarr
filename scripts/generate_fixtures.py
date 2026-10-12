@@ -91,7 +91,7 @@ DATATREE_FIXTURE_VERSION = "1"
 ERA5_FIXTURE_VERSION = "1"
 MANY_TABLES_FIXTURE_VERSION = "1"
 CASE_NAMES_FIXTURE_VERSION = "1"
-SPATIALDATA_FIXTURE_VERSION = "1"
+SPATIALDATA_FIXTURE_VERSION = "2"
 UNSUPPORTED_FIXTURE_VERSION = "1"
 UNREADABLE_FIXTURE_VERSION = "1"
 
@@ -1013,9 +1013,12 @@ def main() -> None:
             obs=pd.DataFrame(index=["s1", "s2"]),
             var=pd.DataFrame(index=["g9"]),
         )
+        # write_zarr to a directory inside the store works on every anndata
+        # release; write_elem moved between modules.
         with ad.settings.override(zarr_write_format=3):
-            ad.io.write_elem(tables, "cells", cells)
-            ad.io.write_elem(tables, "spots", spots)
+            cells.write_zarr(dest / "tables" / "cells")
+            spots.write_zarr(dest / "tables" / "spots")
+        tables = zarr.open_group(str(dest / "tables"), mode="a", use_consolidated=False)
         tables["cells"].attrs.update({
             "spatialdata-encoding-type": "ngff:regions_table",
             "region": "cells",

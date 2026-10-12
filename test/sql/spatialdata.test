@@ -23,15 +23,18 @@ require zarr
 
 # ══ Catalog ══════════════════════════════════════════════════════════════════
 
+# Newer anndata releases write an index as a nullable string array, whose
+# values are at <frame>/_index/values; the trim makes both read the same.
 query TTTTT
-SELECT group_path, schema_name, table_name, dims, coord_vars
+SELECT group_path, schema_name, table_name, dims,
+  [regexp_replace(c, '/values$', '') FOR c IN coord_vars]
 FROM read_zarr_tables('test/fixtures/anndata/spatialdata_like.zarr');
 ----
 /labels/cells	labels/cells	y_x	[y, x]	[]
-/tables/cells	tables/cells	obs	[obs]	[tables/cells/obs/_index/values]
-/tables/cells	tables/cells	obs_var	[obs, var]	[tables/cells/obs/_index/values, tables/cells/var/_index/values]
-/tables/cells/obsm	tables/cells/obsm	obs_spatial_component	[obs, spatial_component]	[tables/cells/obs/_index/values]
-/tables/spots	tables/spots	obs_var	[obs, var]	[tables/spots/obs/_index/values, tables/spots/var/_index/values]
+/tables/cells	tables/cells	obs	[obs]	[tables/cells/obs/_index]
+/tables/cells	tables/cells	obs_var	[obs, var]	[tables/cells/obs/_index, tables/cells/var/_index]
+/tables/cells/obsm	tables/cells/obsm	obs_spatial_component	[obs, spatial_component]	[tables/cells/obs/_index]
+/tables/spots	tables/spots	obs_var	[obs, var]	[tables/spots/obs/_index, tables/spots/var/_index]
 
 # AnnData axis names apply inside the objects only.
 query TT

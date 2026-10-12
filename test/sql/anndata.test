@@ -200,10 +200,13 @@ g1	g0	5.000000
 
 # An embedding named like a CF bounds variable (*_bounds, two components) is
 # data in an AnnData store, not a bounds variable left out of every table.
+# Newer anndata releases write the index as a nullable string array, whose
+# values are at obs/_index/values; the trim makes both read the same.
 query TTT
-SELECT table_name, data_vars, coord_vars FROM read_zarr_tables('test/fixtures/anndata/axis_named_columns.zarr', group_path := 'obsm');
+SELECT table_name, data_vars, [regexp_replace(c, '/values$', '') FOR c IN coord_vars]
+FROM read_zarr_tables('test/fixtures/anndata/axis_named_columns.zarr', group_path := 'obsm');
 ----
-obs_spatial_bounds_component	[obsm/spatial_bounds]	[obs/_index/values]
+obs_spatial_bounds_component	[obsm/spatial_bounds]	[obs/_index]
 
 query T
 SELECT role FROM read_zarr_metadata('test/fixtures/anndata/axis_named_columns.zarr', array_path := 'obsm/spatial_bounds');
