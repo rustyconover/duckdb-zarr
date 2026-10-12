@@ -131,16 +131,15 @@ SELECT COUNT(*) FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr', 
 ----
 1
 
-# axis_named_columns.zarr (scripts/generate_fixtures.py): obs columns `obs`
-# and `Obs` both collide with the obs dimension column (DuckDB column names
-# ignore case), so they keep their store paths; those collide too, so the later
-# one gets a number.
-query TII
-SELECT obs, "obs/obs", "obs/Obs_1" FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', table_name := 'obs') ORDER BY obs;
+# axis_named_columns.zarr (scripts/generate_fixtures.py): the obs column `Obs`
+# collides with the obs dimension column (DuckDB column names ignore case), so
+# it keeps its store path.
+query TI
+SELECT obs, "obs/Obs" FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', table_name := 'obs') ORDER BY obs;
 ----
-c0	0	1
-c1	10	2
-c2	20	3
+c0	1
+c1	2
+c2	3
 
 # A column named `obs` in an obsm data frame is a column, not the coordinate.
 query TI

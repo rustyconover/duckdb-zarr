@@ -85,7 +85,7 @@ def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
 # otherwise it is rebuilt. Without this, a copy left over from an older checkout
 # makes the SQL tests fail on value differences that are hard to trace.
 ANNDATA_FIXTURE_VERSION = "6"
-AXIS_NAMED_FIXTURE_VERSION = "4"
+AXIS_NAMED_FIXTURE_VERSION = "5"
 RAGGED_FIXTURE_VERSION = "2"
 DATATREE_FIXTURE_VERSION = "1"
 ERA5_FIXTURE_VERSION = "1"
@@ -896,8 +896,10 @@ def main() -> None:
     # ── anndata/axis_named_columns (real anndata writer) ─────────────────────
     # Tests (test/sql/anndata.test) for columns named like a dimension, and for
     # tables that mix sparse storage:
-    #   * obs columns `obs` and `Obs`, which collide with the obs dimension
-    #     column (DuckDB names ignore case), so both keep their store paths;
+    #   * an obs column `Obs`, which collides with the obs dimension column
+    #     (DuckDB names ignore case), so it keeps its store path. A second
+    #     column `obs` would test paths that collide too, but obs/obs and
+    #     obs/Obs are one directory on macOS and Windows filesystems;
     #   * obsm/df, a data frame with a column `obs`;
     #   * layers a (CSR) and b (CSC) only: a sparse table that mixes storage;
     #   * obsp d (dense, chunks (2, 2)), r (CSR) and c (CSC), all 3x3: sparse
@@ -918,8 +920,7 @@ def main() -> None:
         if dest.exists():
             _rmtree(dest)
         names = ["c0", "c1", "c2"]
-        obs = pd.DataFrame({"obs": np.arange(3, dtype=np.int64) * 10,
-                            "Obs": np.arange(3, dtype=np.int64) + 1}, index=names)
+        obs = pd.DataFrame({"Obs": np.arange(3, dtype=np.int64) + 1}, index=names)
         dense = np.arange(9, dtype=np.float64).reshape(3, 3)
 
         def duplicated(data, indices, indptr, n):
