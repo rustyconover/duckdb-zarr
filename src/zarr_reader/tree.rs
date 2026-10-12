@@ -84,6 +84,12 @@ pub fn schema_name(node: &str) -> String {
     }
 }
 
+/// A name as DuckDB compares identifiers: ASCII letters ignore case, other
+/// characters do not (`Abc` and `abc` are one view, `Ärger` and `ärger` two).
+pub fn fold_case(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
 /// xarray-sql's default table name (`xarray_sql.df.default_table_name`): the
 /// dimension names joined by `_` in dimension order, or `scalar` for none.
 pub fn default_table_name(dims: &[String]) -> String {
@@ -306,7 +312,7 @@ impl StoreTree {
     /// shape; `read_zarr` cannot read those dims as one table. A node that is
     /// not aligned with its ancestors is reported in
     /// [`NodeTables::misaligned`] rather than as an error, so that
-    /// `read_zarr_groups` can still list the rest of the store.
+    /// `read_zarr_tables` can still list the rest of the store.
     pub fn tables(&self, node: &str) -> NodeTables {
         let mut misaligned = self.check_alignment(node).err();
         let facts: Vec<ArrayFacts> = self
@@ -446,7 +452,7 @@ pub struct NodeTables {
     pub tables: Vec<Table>,
     pub unnamed: Vec<String>,
     /// Why the node is not aligned with its ancestors, if it is not. `read_zarr`
-    /// fails with this message; `read_zarr_groups` gives the node's rows no table
+    /// fails with this message; `read_zarr_tables` gives the node's rows no table
     /// name.
     pub misaligned: Option<String>,
 }
@@ -491,7 +497,7 @@ pub fn ensure_group_exists(
         return Ok(());
     }
     Err(format!(
-        "'{store_path}': group '{}' not found; run read_zarr_groups('{store_path}') to list \
+        "'{store_path}': group '{}' not found; run read_zarr_tables('{store_path}') to list \
          the groups",
         display_group(node)
     )
@@ -515,11 +521,11 @@ pub fn table_names(tables: &[Table]) -> Vec<Option<String>> {
         .collect();
     let mut folded: HashMap<String, usize> = HashMap::new();
     for name in names.iter().flatten() {
-        *folded.entry(name.to_lowercase()).or_default() += 1;
+        *folded.entry(fold_case(name)).or_default() += 1;
     }
     names
         .into_iter()
-        .map(|name| name.filter(|n| folded[&n.to_lowercase()] == 1))
+        .map(|name| name.filter(|n| folded[&fold_case(n)] == 1))
         .collect()
 }
 

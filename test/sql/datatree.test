@@ -236,3 +236,32 @@ SELECT COUNT(*), COUNT(view_name)
 FROM read_zarr_views('test/fixtures/xarray_tutorial/many_tables.zarr', 'many');
 ----
 2101	2100
+
+# ── Names DuckDB folds together ──────────────────────────────────────────────
+# DuckDB ignores the case of ASCII letters in identifiers, even quoted ones, so
+# the group /Main is the schema main, and its x table would replace the root's.
+statement error
+SELECT * FROM read_zarr_views('test/fixtures/xarray_tutorial/case_names.zarr', 'cn');
+----
+tables 'x' and 'Main/x' would both be view 'x' in schema 'Main'
+
+# Renaming one of them mounts both; the group's view goes into main too.
+query TTT
+SELECT * FROM read_zarr_views('test/fixtures/xarray_tutorial/case_names.zarr', 'cn',
+  view_names := MAP {'Main/x': 'main_x'});
+----
+NULL	NULL	ATTACH IF NOT EXISTS ':memory:' AS "cn";
+main	x	CREATE OR REPLACE VIEW "cn"."main"."x" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/case_names.zarr', table_name := 'x');
+main	Ärger	CREATE OR REPLACE VIEW "cn"."main"."Ärger" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/case_names.zarr', table_name := 'Ärger');
+Main	main_x	CREATE OR REPLACE VIEW "cn"."Main"."main_x" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/case_names.zarr', group_path := 'Main', table_name := 'x');
+
+# table_name := folds case the same way: ASCII letters only.
+query I
+SELECT SUM(v) FROM read_zarr('test/fixtures/xarray_tutorial/case_names.zarr', table_name := 'ÄRGER');
+----
+15
+
+statement error
+SELECT SUM(v) FROM read_zarr('test/fixtures/xarray_tutorial/case_names.zarr', table_name := 'ärger');
+----
+has no table named 'ärger'

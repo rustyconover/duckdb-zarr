@@ -230,7 +230,7 @@ impl VTab for ReadZarrVTab {
                 ));
             }
             msg.push_str(&format!(
-                ". Use group_path= to read another group; read_zarr_groups('{store_path}') lists \
+                ". Use group_path= to read another group; read_zarr_tables('{store_path}') lists \
                  the tables in every group"
             ));
             return Err(msg.into());
@@ -438,7 +438,10 @@ fn table_named<'a>(tables: &'a [Table], name: &str) -> Option<&'a Table> {
     tables
         .iter()
         .zip(names)
-        .find(|(_, n)| n.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+        .find(|(_, n)| {
+            n.as_deref()
+                .is_some_and(|n| tree::fold_case(n) == tree::fold_case(name))
+        })
         .map(|(table, _)| table)
 }
 

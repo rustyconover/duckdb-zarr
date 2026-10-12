@@ -16,6 +16,7 @@ use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
 use crate::read_zarr_tables::catalog_rows;
 use crate::selection::Selection;
 use crate::zarr_reader::meta::raw_bind_info;
+use crate::zarr_reader::tree;
 
 #[derive(Debug, Clone)]
 struct Statement {
@@ -64,8 +65,9 @@ impl VTab for ReadZarrViewsVTab {
             view_name: None,
             sql: format!("ATTACH IF NOT EXISTS ':memory:' AS {db};"),
         }];
-        // Views per schema, by lowercased name, to catch two views that DuckDB
-        // would see as one.
+        // Views per schema, both keyed by tree::fold_case, to catch two views
+        // that DuckDB would see as one. Schema names fold too: groups `Sim`
+        // and `sim` are one DuckDB schema.
         let mut taken: HashMap<String, HashMap<String, String>> = HashMap::new();
         let rows = catalog_rows(bind, &store_path, Selection::Store)?;
         let mut paths = Vec::new();
@@ -79,7 +81,7 @@ impl VTab for ReadZarrViewsVTab {
             if view_name.is_empty() {
                 return Err(format!("view_names gives table '{path}' an empty name").into());
             }
-            let views = taken.entry(row.schema_name.clone()).or_default();
+            let views = taken.entry(tree::fold_case(&row.schema_name)).or_default();
             if views.is_empty() && !node.is_empty() {
                 statements.push(Statement {
                     schema_name: Some(row.schema_name.clone()),
@@ -90,7 +92,7 @@ impl VTab for ReadZarrViewsVTab {
                     ),
                 });
             }
-            if let Some(other) = views.insert(view_name.to_lowercase(), path.clone()) {
+            if let Some(other) = views.insert(tree::fold_case(&view_name), path.clone()) {
                 return Err(format!(
                     "tables '{other}' and '{path}' would both be view '{view_name}' in schema \
                      '{}'; rename one with view_names := MAP {{'{path}': '...'}}",
