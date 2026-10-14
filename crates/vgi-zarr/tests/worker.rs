@@ -458,8 +458,7 @@ fn missing_http_chunk_keeps_zarr_fill_semantics() -> Result<()> {
         .assert_matches(&expected)
 }
 
-#[test]
-fn sharded_data_works_with_ranged_and_full_http_responses() -> Result<()> {
+fn sharded_fixture(index_location: &str, checksum: bool) -> Fixture {
     let mut f = Fixture::new();
     f.array(
         "x",
@@ -467,33 +466,125 @@ fn sharded_data_works_with_ranged_and_full_http_responses() -> Result<()> {
         &[1_i64, 2, 3, 4],
     );
     let mut a = metadata("int64", &[4], &[4], &["x"]);
+    let mut index_codecs = vec![json!({"name":"bytes", "configuration":{"endian":"little"}})];
+    if checksum {
+        index_codecs.push(json!({"name":"crc32c"}));
+    }
     a["codecs"] = json!([{"name":"sharding_indexed", "configuration":{
         "chunk_shape":[2], "codecs":[{"name":"bytes", "configuration":{"endian":"little"}}],
-        "index_codecs":[{"name":"bytes", "configuration":{"endian":"little"}}, {"name":"crc32c"}], "index_location":"end"
+        "index_codecs":index_codecs, "index_location":index_location
     }}]);
     f.array("a", a, &[10_i64, 20, 30, 40]);
-    let options = scan_options(&basic_schema(), &i64_filter("x", Comparison::Eq, 3), None)?;
-    for ignore_ranges in [false, true] {
-        let http = HttpFixture::new(&f, HashMap::new(), ignore_ranges);
-        let mut w = worker()?;
-        let logs = capture(&mut w);
-        w.check_pushdown(&source(&http.url), &options, |full| {
-            select(full, |b, r| i64_at(b, 0, r) == 3)
-        })?;
-        let logs = logs.lock().unwrap();
-        let finish = logs
-            .iter()
-            .rev()
-            .find(|m| extra(m, "event").as_deref() == Some("scan.finished"))
-            .unwrap();
-        assert_eq!(extra(finish, "chunks_read").as_deref(), Some("1"));
-        assert_eq!(extra(finish, "chunks_skipped").as_deref(), Some("1"));
-        // One index (36 B) + one subchunk (16 B), or two full 68 B responses.
-        assert_eq!(
-            extra(finish, "bytes_read").as_deref(),
-            Some(if ignore_ranges { "136" } else { "52" })
-        );
+    f
+}
+
+#[test]
+fn sharded_queries_reuse_indexes_and_account_for_actual_http_bytes() -> Result<()> {
+    for index_location in ["start", "end"] {
+        for checksum in [false, true] {
+            let f = sharded_fixture(index_location, checksum);
+            let index_size = if checksum { 36 } else { 32 };
+            let shard_size = index_size + 32;
+            let index_header = if index_location == "start" {
+                format!("bytes=0-{}", index_size - 1)
+            } else {
+                format!("bytes=-{index_size}")
+            };
+            for ignore_ranges in [false, true] {
+                let http = HttpFixture::new(&f, HashMap::new(), ignore_ranges);
+                let mut w = worker()?;
+                let logs = capture(&mut w);
+                // Different queries and subchunks, in the same worker process.
+                for (query, x) in [3, 1, 3].into_iter().enumerate() {
+                    let options =
+                        scan_options(&basic_schema(), &i64_filter("x", Comparison::Eq, x), None)?;
+                    let expected = ScanResult::try_new(
+                        basic_schema(),
+                        vec![RecordBatch::try_new(
+                            basic_schema(),
+                            vec![
+                                Arc::new(Int64Array::from(vec![x])),
+                                Arc::new(Int64Array::from(vec![x * 10])),
+                            ],
+                        )
+                        .unwrap()],
+                    )?;
+                    w.scan(&source(&http.url), &options)?
+                        .assert_matches(&expected)?;
+                    let requests = http.requests.lock().unwrap();
+                    assert_eq!(
+                        requests.iter().filter(|key| *key == "a/c/0").count(),
+                        query + 2
+                    );
+                    let messages = logs.lock().unwrap();
+                    let finishes = messages
+                        .iter()
+                        .filter(|m| extra(m, "event").as_deref() == Some("scan.finished"))
+                        .collect::<Vec<_>>();
+                    assert_eq!(finishes.len(), query + 1);
+                    let finish = finishes[query];
+                    assert_eq!(extra(finish, "chunks_read").as_deref(), Some("1"));
+                    assert_eq!(extra(finish, "chunks_skipped").as_deref(), Some("1"));
+                    let bytes = if ignore_ranges {
+                        shard_size * if query == 0 { 2 } else { 1 }
+                    } else {
+                        16 + if query == 0 { index_size } else { 0 }
+                    };
+                    assert_eq!(extra(finish, "bytes_read"), Some(bytes.to_string()));
+                    if query > 0 {
+                        assert_ne!(
+                            extra(finishes[0], "execution_id"),
+                            extra(finish, "execution_id")
+                        );
+                    }
+                }
+                let ranges = http.ranges.lock().unwrap();
+                assert_eq!(
+                    ranges
+                        .iter()
+                        .filter(|(key, range)| {
+                            key == "a/c/0" && range.as_deref() == Some(index_header.as_str())
+                        })
+                        .count(),
+                    1
+                );
+            }
+        }
     }
+    Ok(())
+}
+
+#[test]
+fn evicting_opened_dataset_also_discards_its_indexes() -> Result<()> {
+    let f = sharded_fixture("end", true);
+    let http = HttpFixture::new(&f, HashMap::new(), false);
+    let options = scan_options(&basic_schema(), &i64_filter("x", Comparison::Eq, 3), None)?;
+    let mut w = worker()?;
+    let logs = capture(&mut w);
+    w.scan(&source(&http.url), &options)?;
+    // The worker retains four opened stores. Keep fixtures alive so every path
+    // stays distinct while filling that cache with other datasets.
+    let others: Vec<_> = (0..4).map(|_| Fixture::basic()).collect();
+    for other in &others {
+        w.scan(&other.spec(), &ScanOptions::default())?;
+    }
+    w.scan(&source(&http.url), &options)?;
+    assert_eq!(
+        http.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|key| *key == "a/c/0")
+            .count(),
+        4
+    );
+    let logs = logs.lock().unwrap();
+    let finish = logs
+        .iter()
+        .rev()
+        .find(|m| extra(m, "event").as_deref() == Some("scan.finished"))
+        .unwrap();
+    assert_eq!(extra(finish, "bytes_read").as_deref(), Some("52"));
     Ok(())
 }
 

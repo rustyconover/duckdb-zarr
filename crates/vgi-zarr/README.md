@@ -63,9 +63,22 @@ source work before exact SDK filtering: logical grid rows decoded, chunk tuples
 indexes. A tuple counts once even when several data variables are read.
 Coordinate-only projections read no data chunks. Metadata/coordinate loading at
 bind time is excluded. HTTP byte counts include the full response when a server
-ignores Range. Counters and shard decoders belong to one execution; only metadata
-and coordinates are cached across executions. Failed or cancelled scans may have
-no finish event.
+ignores Range. Counters and shard decoders belong to one execution. Metadata,
+coordinates, and encoded shard indexes are cached across executions in the same
+worker process. A warm index costs no source bytes; its data read is charged to
+the current execution. Concurrent readers share a pending index fetch, whose
+bytes are charged only to the execution performing that fetch. Failed or
+cancelled scans may have no finish event.
+
+The shared index cache retains at most 4 MiB and 4096 entries per opened dataset,
+evicting the least recently used indexes. It caches known index ranges for
+regular, exclusively sharded arrays without storage transformers; other layouts
+use the existing uncached reads. Only index bytes are retained, even if an HTTP
+server returns the entire shard. Index decoding remains local to each execution.
+The cache is discarded with the opened dataset (the worker retains four stores).
+As with cached metadata and coordinates, stores are assumed unchanged while
+open. Use versioned dataset paths or restart the worker after modifying a store
+in place; the cache does not revalidate remote objects on every query.
 
 Only HTTP 404 means a missing chunk and uses Zarr fill semantics. HTTP 403 fails
 with `PermissionDenied`; 5xx errors remain failures. Source errors carry typed

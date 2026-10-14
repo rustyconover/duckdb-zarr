@@ -24,6 +24,7 @@ use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
 use vgi::FilterHandling;
 use vgi_rpc::{Result, RpcError};
 
+use crate::shard_index_cache::{IndexCachedStore, IndexRange, ShardIndexCache};
 use zarr_core::bounds::chunks_with_kept;
 use zarr_core::meta::{
     build_column_defs, build_work_units_in, dimension_names, infer_dim_groups, list_array_names,
@@ -63,6 +64,8 @@ struct Opened {
     columns: Vec<ColumnDef>,
     coord_arrays: HashMap<String, CoordArray>,
     arrays: HashMap<String, ZarrArray>,
+    index_ranges: HashMap<String, IndexRange>,
+    index_cache: Arc<ShardIndexCache>,
     /// Set when every data variable is sharded with the same subchunk shape:
     /// work units are then subchunks (`chunk_shape` is the subchunk shape) and
     /// each read fetches the shard index once plus one byte range, instead of
@@ -83,7 +86,8 @@ type OpenCache = Mutex<Vec<(Key, Arc<Opened>)>>;
 /// coordinate arrays: small next to decoded chunks, but the
 /// browser demo switches between many stores and wasm memory never shrinks.
 const OPEN_STORES: usize = 4;
-/// Shard indexes cached per array before the cache is reset (~1 KB each).
+/// Decoded indexes cached per execution/array before reset. Encoded indexes
+/// have a separate shared byte budget in `ShardIndexCache`.
 const SHARD_INDEXES: usize = 4096;
 
 /// Most recently used last.
@@ -199,6 +203,10 @@ fn open_uncached(
             .map(|c| Field::new(&c.name, crate::arrow_values::data_type(c), true))
             .collect::<Vec<_>>(),
     ));
+    let index_ranges = arrays
+        .iter()
+        .filter_map(|(name, array)| IndexRange::for_array(array).map(|range| (name.clone(), range)))
+        .collect();
     Ok(Opened {
         dims: group.dims.clone(),
         shape: group.shape.clone(),
@@ -206,6 +214,8 @@ fn open_uncached(
         columns,
         coord_arrays,
         arrays,
+        index_ranges,
+        index_cache: Arc::new(ShardIndexCache::default()),
         sharded,
         schema,
     })
@@ -349,10 +359,21 @@ impl TableFunction for ReadZarr {
         let arrays: HashMap<String, ZarrArray> = o
             .arrays
             .iter()
-            .map(|(name, array)| (name.clone(), array.with_storage(store.clone())))
+            .map(|(name, array)| {
+                let reader: ZarrStore = match o.index_ranges.get(name) {
+                    Some(&index_range) => Arc::new(IndexCachedStore {
+                        inner: store.clone(),
+                        cache: o.index_cache.clone(),
+                        index_range,
+                    }),
+                    None => store.clone(),
+                };
+                (name.clone(), array.with_storage(reader))
+            })
             .collect();
         // zarrs caches partial decoders as well as indexes; keep them with this
         // execution's storage rather than retaining another scan's counters.
+        // IndexCachedStore reuses encoded indexes without retaining readers.
         let shard_caches = o.sharded.then(|| {
             arrays
                 .iter()

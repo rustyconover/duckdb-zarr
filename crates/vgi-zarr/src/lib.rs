@@ -7,6 +7,7 @@
 mod arrow_values;
 mod http_store;
 mod read_zarr;
+mod shard_index_cache;
 mod source;
 
 use vgi::catalog::CatalogModel;

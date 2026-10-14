@@ -57,7 +57,9 @@ and reference-selection tests when changing pruning. The suite covers:
 - Integer widths, signedness, values beyond 2^53, and exact timestamp literals.
 - CF packing, fill sentinels, strings, floating bounds, and multidimensional edge chunks.
 - Actual avoided HTTP requests, 403/503 errors, and legitimate 404 fill values.
-- Sharded reads with 206 ranges and 200 full-object fallback.
+- Sharded reads with 206 ranges and 200 full-object fallback; indexes at either
+  end of the shard, with and without CRC32C.
+- Cross-query index reuse, independent byte counters, and dataset eviction.
 - In-band lifecycle messages, execution IDs, and measured source counters.
 
 ## Inspect execution diagnostics
@@ -66,7 +68,19 @@ and reference-selection tests when changing pruning. The suite covers:
 RPC stream. The diagnostic test installs a sink before scanning and checks both
 start/finish correlation and the actual requested object keys. Running two scans
 in one process verifies that cached metadata does not carry over counters or
-execution IDs. The sharding test additionally checks exact received byte totals.
+execution IDs. The sharding test executes different queries against the same
+shard and asserts exact received byte totals: the first query fetches the index
+and data, and each subsequent query fetches only its data. It also records Range
+headers to verify that the index is requested exactly once. When a server ignores
+Range, each actual full-object response is charged in full.
+
+The cache unit tests exercise eight concurrent execution-local readers sharing
+one index cache: one reader pays for the index, all pay for their own data, and
+the cache retains no execution counters. They also cover byte/entry limits, LRU
+eviction, pending loads, retries after failed or missing reads, and copying index
+slices so a cached index cannot retain a full-shard response. The subprocess
+eviction test opens four other datasets and verifies that returning to the first
+dataset fetches its index again.
 
 For interactive SQL inspection, use the logging query in [README.md](README.md).
 `last_scan()` is a process-local convenience and is not the test oracle.

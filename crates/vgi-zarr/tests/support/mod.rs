@@ -78,11 +78,14 @@ pub fn source(path: &str) -> BindSpec {
         .with_arguments(Arguments::new().positional(path))
 }
 
+type RecordedRange = (String, Option<String>);
+
 /// A local object server, with deterministic errors and optional Range support.
 /// Requests are recorded so pruning tests check actual I/O as well as rows.
 pub struct HttpFixture {
     pub url: String,
     pub requests: Arc<Mutex<Vec<String>>>,
+    pub ranges: Arc<Mutex<Vec<RecordedRange>>>,
     stopped: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -94,6 +97,8 @@ impl HttpFixture {
         let root = fixture.dir.path().to_path_buf();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = requests.clone();
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let captured_ranges = ranges.clone();
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = stopped.clone();
         let thread = thread::spawn(move || {
@@ -103,6 +108,11 @@ impl HttpFixture {
                 };
                 let key = request.url().trim_start_matches('/');
                 captured.lock().unwrap().push(key.to_string());
+                let range = request.headers().iter().find(|h| h.field.equiv("Range"));
+                captured_ranges.lock().unwrap().push((
+                    key.to_string(),
+                    range.map(|header| header.value.as_str().to_string()),
+                ));
                 if let Some(status) = errors.get(key) {
                     request
                         .respond(Response::empty(StatusCode(*status)))
@@ -113,7 +123,6 @@ impl HttpFixture {
                     request.respond(Response::empty(StatusCode(404))).unwrap();
                     continue;
                 };
-                let range = request.headers().iter().find(|h| h.field.equiv("Range"));
                 if let Some(range) = range.filter(|_| !ignore_ranges) {
                     let (start, end) = range
                         .value
@@ -157,6 +166,7 @@ impl HttpFixture {
         Self {
             url,
             requests,
+            ranges,
             stopped,
             thread: Some(thread),
         }
